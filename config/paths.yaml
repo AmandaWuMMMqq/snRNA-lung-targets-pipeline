@@ -1,0 +1,26 @@
+input:
+  fetal_rds: "PATH/TO/TF_fetal_nuc.rds"
+  pediatric_rds: "PATH/TO/TF_ped_nuc.rds"
+  # Pre-computed checkpoints (set to null to rebuild from scratch)
+  fetal_clustered_rds: null
+  pediatric_clustered_rds: null
+  joint_clustered_rds: null
+  epi_pre_rds: null
+  epi_post_rds: null
+  # Alveolar subset checkpoints (from prior sessions)
+  alve_subset_rds: null
+  pre_alve_rds: null
+  post_alve_rds: null
+  # tradeSeq SCE checkpoint
+  sce_post_rds: null
+  # CellChat checkpoint
+  cellchat_rds: null
+
+output:
+  root: "outputs"
+  rds: "outputs/rds"
+  plots: "outputs/plots"
+  tables: "outputs/tables"
+  audit: "outputs/audit"
+  logs: "outputs/logs"
+  reports: "outputs/reports"

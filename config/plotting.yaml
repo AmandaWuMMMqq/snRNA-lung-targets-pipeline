@@ -1,0 +1,49 @@
+dimensions:
+  default_width: 8
+  default_height: 6
+  wide_width: 15
+  tall_height: 12
+  square_size: 10
+  umap_width: 12
+  umap_height: 10
+  dpi: 300
+
+color_palettes:
+  sequential: ["lightgrey", "#EDF8B1", "#C7E9B4", "#7FCDBB", "#41B6C4",
+               "#1D91C0", "#225EA8", "#253494", "#081D58"]
+  group_fetal: "#6A3D9A"
+  group_pediatric: "#F28E2B"
+  slingshot_primary: "maroon"
+  slingshot_secondary: "darkblue"
+  slingshot_alpha: 0.8
+  slingshot_lwd: 5
+
+umap:
+  pt_size: 0.5
+  raster: false
+  label: false
+  repel: true
+  legend_text_size: 18
+  legend_title_size: 24
+  label_size: 7
+
+feature_plot:
+  pt_size: 0.2
+  raster: false
+  ncol: 2
+
+ridge_plot:
+  scale: 2.2
+  rel_min_height: 0.01
+  line_size: 0.2
+  n_pseudotime_colors: 200
+
+heatmap:
+  row_names_fontsize: 6
+  col_names_fontsize: 12
+
+age_gradient:
+  fetal_palette: "Purples"
+  pediatric_palette: "Oranges"
+  fetal_pt_size: 0.5
+  pediatric_pt_size: 0.5

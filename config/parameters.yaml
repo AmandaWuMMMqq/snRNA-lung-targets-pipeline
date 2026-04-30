@@ -1,0 +1,86 @@
+memory:
+  future_globals_max_size_gb: 40
+
+random_seed: 123
+
+seurat:
+  dims: 30
+  resolution: 0.5
+  integration_method: "RPCAIntegration"
+  normalization_method: "SCT"
+  variable_features_n: 3000
+  vars_to_regress: ["percent.mt"]
+
+pediatric:
+  downsample_n: 27411  # match fetal cell count for balanced integration
+
+qc:
+  min_features: null
+  max_percent_mt: null
+  min_cells: null
+
+subsetting:
+  epithelial_lineage_labels:
+    - "Epithelium"
+  alveolar_labels:
+    - "AT1_1"
+    - "AT1_2"
+    - "AT1_3"
+    - "AT1_4"
+    - "AT1_5"
+    - "AT2_1"
+    - "AT2_2"
+    - "AT2_3"
+    - "AT2_4"
+    - "Bud Tip"
+    - "Transitional"
+    - "Transitional/Bud Tip Adjacent"
+  contaminant_genes:
+    - gene: "CLDN5"
+      threshold: 0.1
+    - gene: "VWF"
+      threshold: 0.1
+    - gene: "PTPRC"
+      threshold: 0.1
+    - gene: "COL1A2"
+      threshold: 0.1
+    - gene: "PECAM1"
+      threshold: 0.1
+    - gene: "PDGFRA"
+      threshold: 0.1
+
+trajectory:
+  start_cluster: "Bud Tip"
+  slingshot_reduction: "umap"
+  dist_method_primary: "mnn"
+  dist_method_secondary: "slingshot"
+  approx_points: 150
+  thresh: 0.01
+  stretch: 0.8
+  allow_breaks: false
+  shrink: 0.99
+  # Lineage subsets to retain per run
+  bt_mnn_keep_lineages: [1, 3, 4]
+  bt_slingshot_keep_lineages: [2, 3]
+  t2_mnn_keep_lineage: [4]
+  t1_slingshot_keep_lineage: [3]
+
+tradeseq:
+  nknots: 8
+  cores: 10
+
+cellchat:
+  database: "human"
+  min_cells: 10
+  compute_prob_type: "triMean"
+  n_patterns_outgoing: 6
+  n_patterns_incoming: 2
+  pathways_of_interest:
+    - "BMP"
+    - "TGFb"
+    - "FGF"
+
+plots:
+  width: 8
+  height: 6
+  dpi: 300

@@ -1,0 +1,2318 @@
+---
+title: "snRNA-seq Analysis: Fetal–Pediatric Lung Alveolar Lineage"
+author: "Spence Lab"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup-libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Core single-cell and Seurat ecosystem
+library(dplyr)
+library(Seurat)
+library(SeuratWrappers)
+library(patchwork)
+library(ggplot2)
+library(sctransform)
+library(Signac)
+
+# Dimensionality reduction / trajectory
+library(slingshot)
+library(SingleCellExperiment)
+library(tradeSeq)
+library(BiocParallel)
+
+# Visualization helpers
+library(RColorBrewer)
+library(viridis)
+library(ComplexHeatmap)
+library(pheatmap)
+library(ggridges)
+library(ggrepel)
+library(ggnewscale)
+library(cowplot)
+library(circlize)
+
+# Data wrangling
+library(tidyverse)
+library(tibble)
+library(tidytext)
+
+# Marker / DE analysis
+library(presto)
+library(writexl)
+
+# Cell–cell communication
+library(CellChat)
+library(NMF)
+library(ggalluvial)
+
+# Utilities
+library(R.utils)
+
+set.seed(123)
+options(future.globals.maxSize = 80 * 1024^3)
+```
+
+```{r setup-helpers}
+# Custom sequential color gradient used across all FeaturePlots
+my_colors <- scale_color_gradientn(colors = c(
+  "lightgrey", "#EDF8B1", "#C7E9B4", "#7FCDBB", "#41B6C4",
+  "#1D91C0", "#225EA8", "#253494", "#081D58"
+))
+
+# Same palette as a colorRampPalette function (used in base-R Slingshot plots)
+my_colors_fn <- colorRampPalette(rev(c(
+  "#EDF8B1", "#C7E9B4", "#7FCDBB", "#41B6C4",
+  "#1D91C0", "#225EA8", "#253494", "#081D58"
+)))
+
+# Scale a numeric vector to [0, 1]; returns NA-safe result
+scale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || rng[2] == rng[1])
+    return(rep(NA_real_, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# Compute weighted-average combined pseudotime from a SlingshotDataSet
+combined_pt_from_sds <- function(sds, cells) {
+  pt <- slingPseudotime(sds)
+  w  <- slingCurveWeights(sds)
+  pt <- pt[cells, , drop = FALSE]
+  w  <- w[cells,  , drop = FALSE]
+  pt_scaled <- apply(pt, 2, scale01)
+  w_sum     <- rowSums(w, na.rm = TRUE)
+  pt_one    <- rowSums(pt_scaled * w, na.rm = TRUE) / w_sum
+  pt_one[!is.finite(pt_one)] <- NA_real_
+  pt_one
+}
+
+# Normalize cell-type label strings for fuzzy matching
+normalize_labels <- function(x) {
+  x <- as.character(x); x <- trimws(x); x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x); x <- gsub("^_|_$", "", x)
+  x
+}
+```
+
+------------------------------------------------------------------------
+
+# Data Input: Load Individual Pre-processed Objects
+
+> **Context:** Raw per-sample CellRanger outputs were previously loaded,
+> QC-filtered, and saved as Seurat objects with metadata (batch, sex,
+> age, age_days, group, TF_annotation). Those objects are loaded here as
+> the starting point.
+
+```{r load-individual-objects}
+# Fetal nuclei (all fetal samples merged, pre-integration)
+TF_fetal_nuc <- readRDS(
+  "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_nuc.rds"
+)
+
+# Pediatric nuclei (all pediatric samples merged, pre-integration)
+TF_pediatric_nuc <- readRDS(
+  "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_ped_nuc.rds"
+)
+```
+
+```{r inspect-individual-objects}
+# Quick summary of input objects
+TF_fetal_nuc
+TF_pediatric_nuc
+
+# Metadata column inventory
+colnames(TF_fetal_nuc@meta.data)
+colnames(TF_pediatric_nuc@meta.data)
+
+# Cell counts per batch
+table(TF_fetal_nuc$batch)
+table(TF_pediatric_nuc$batch)
+```
+
+------------------------------------------------------------------------
+
+# Individual Object Integration
+
+## Fetal: SCTransform + RPCA Integration
+
+```{r integrate-fetal}
+# Normalize with SCTransform (regress percent mitochondrial reads)
+TF_fetal_nuc <- SCTransform(
+  TF_fetal_nuc,
+  vars.to.regress = "percent.mt",
+  verbose = FALSE
+)
+
+# Dimensionality reduction and clustering
+TF_fetal_nuc <- RunPCA(TF_fetal_nuc, dims = 1:30, verbose = FALSE)
+
+# RPCA batch integration across layers
+TF_fetal_nuc <- IntegrateLayers(
+  object             = TF_fetal_nuc,
+  method             = RPCAIntegration,
+  normalization.method = "SCT",
+  verbose            = FALSE
+)
+
+# Clustering
+TF_fetal_nuc <- FindNeighbors(TF_fetal_nuc, dims = 1:30, verbose = FALSE)
+TF_fetal_nuc <- FindClusters(TF_fetal_nuc, resolution = 0.5)
+TF_fetal_nuc <- RunUMAP(TF_fetal_nuc, dims = 1:30)
+```
+
+```{r save-fetal-clustered}
+saveRDS(TF_fetal_nuc, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_nuc_cluster.rds")
+```
+
+```{r visualize-fetal-umap}
+# Inspect integration quality and known metadata fields
+DimPlot(TF_fetal_nuc, reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal – Clusters")
+
+DimPlot(TF_fetal_nuc, group.by = "batch", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal – Batch")
+
+DimPlot(TF_fetal_nuc, group.by = "sex", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal – Sex")
+
+DimPlot(TF_fetal_nuc, group.by = "age", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal – Age")
+
+DimPlot(TF_fetal_nuc, group.by = "TF_annotation", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal – TF Annotation")
+```
+
+## Pediatric: Downsample, SCTransform + RPCA Integration
+
+```{r downsample-pediatric}
+# Downsample pediatric to match fetal cell count (n = 27,411) for balanced integration
+TF_pediatric_nuc_subset <- subset(
+  TF_pediatric_nuc,
+  cells = sample(colnames(TF_pediatric_nuc), 27411)
+)
+```
+
+```{r integrate-pediatric}
+# Join layers before splitting by batch for RPCA
+TF_pediatric_nuc <- JoinLayers(TF_pediatric_nuc)
+TF_pediatric_nuc[["RNA"]] <- split(
+  TF_pediatric_nuc[["RNA"]],
+  f = TF_pediatric_nuc$batch
+)
+
+TF_pediatric_nuc <- SCTransform(
+  TF_pediatric_nuc,
+  vars.to.regress = "percent.mt",
+  verbose = FALSE
+)
+TF_pediatric_nuc <- RunPCA(TF_pediatric_nuc, dims = 1:30, verbose = FALSE)
+
+TF_pediatric_nuc <- IntegrateLayers(
+  object               = TF_pediatric_nuc,
+  method               = RPCAIntegration,
+  normalization.method = "SCT",
+  verbose              = FALSE
+)
+
+TF_pediatric_nuc <- FindNeighbors(TF_pediatric_nuc, dims = 1:30, verbose = FALSE)
+TF_pediatric_nuc <- FindClusters(TF_pediatric_nuc, resolution = 0.5)
+TF_pediatric_nuc <- RunUMAP(TF_pediatric_nuc, dims = 1:30)
+```
+
+```{r save-pediatric-clustered}
+saveRDS(TF_pediatric_nuc, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_pediatric_nuc_cluster.rds")
+```
+
+```{r integrate-pediatric-subset}
+# Join layers before splitting by batch for RPCA
+TF_pediatric_nuc_subset <- JoinLayers(TF_pediatric_nuc_subset)
+TF_pediatric_nuc_subset[["RNA"]] <- split(
+  TF_pediatric_nuc_subset[["RNA"]],
+  f = TF_pediatric_nuc_subset$batch
+)
+
+TF_pediatric_nuc_subset <- SCTransform(
+  TF_pediatric_nuc_subset,
+  vars.to.regress = "percent.mt",
+  verbose = FALSE
+)
+TF_pediatric_nuc_subset <- RunPCA(TF_pediatric_nuc_subset, dims = 1:30, verbose = FALSE)
+
+TF_pediatric_nuc_subset <- IntegrateLayers(
+  object               = TF_pediatric_nuc_subset,
+  method               = RPCAIntegration,
+  normalization.method = "SCT",
+  verbose              = FALSE
+)
+
+TF_pediatric_nuc_subset <- FindNeighbors(TF_pediatric_nuc_subset, dims = 1:30, verbose = FALSE)
+TF_pediatric_nuc_subset <- FindClusters(TF_pediatric_nuc_subset, resolution = 0.5)
+TF_pediatric_nuc_subset <- RunUMAP(TF_pediatric_nuc_subset, dims = 1:30)
+```
+
+```{r save-pediatric-subset-clustered}
+saveRDS(TF_pediatric_nuc_subset, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_pediatric_nuc_subset_cluster.rds")
+```
+
+```{r visualize-pediatric-umap}
+DimPlot(TF_pediatric_nuc_subset, reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – Clusters")
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "batch", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – Batch")
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "sex", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – Sex")
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "age", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – Age")
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "TF_annotation_lvl1", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – TF Annotation lvl1")
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "TF_annotation_lvl2", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – TF Annotation lvl2")
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "TF_annotation_lvl3", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – TF Annotation lvl3")
+```
+
+------------------------------------------------------------------------
+
+# Lineage Annotation of Individual Objects
+
+## Fetal Lineage Assignment
+
+```{r annotate-fetal-lineage}
+# Assign broad lineage labels to fetal clusters based on marker gene knowledge
+# NOTE: Update cluster-to-lineage map after reviewing cluster marker results
+cluster_to_lineage_fetal <- c(
+  "0"  = "Mesenchyme",
+  "1"  = "Mesenchyme",   # Fibroblast
+  "2"  = "Mesenchyme",   # Fibroblast
+  "3"  = "Mesenchyme",   # Fibroblast
+  "4"  = "Epithelium",   # AT2
+  "5"  = "Epithelium",   # LAP
+  "6"  = "Epithelium",   # AT1
+  "7"  = "Mesenchyme",
+  "8"  = "Endothelium",
+  "9"  = "Mesenchyme",
+  "10" = "Mesenchyme",
+  "11" = "Immune",       # Macrophage
+  "12" = "Epithelium",   # Multiciliated
+  "13" = "Endothelium",  # Pericyte
+  "14" = "Immune",
+  "15" = "Endothelium",
+  "16" = "Mesenchyme",
+  "17" = "Epithelium",   # Neuroendocrine
+  "18" = "Immune",       # B-Cells
+  "19" = "Endothelium"
+)
+
+TF_fetal_nuc@meta.data$lineage <- cluster_to_lineage_fetal[
+  as.character(TF_fetal_nuc$seurat_clusters)
+]
+```
+
+```{r visualize-fetal-lineage}
+DimPlot(TF_fetal_nuc, group.by = "lineage_lvl1", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal – Lineage")
+```
+
+## Pediatric Lineage Assignment
+
+```{r annotate-pediatric-lineage}
+cluster_to_lineage_ped <- c(
+  "0"  = "Epithelium",
+  "1"  = "Epithelium",
+  "2"  = "Epithelium",
+  "3"  = "Epithelium",
+  "4"  = "Epithelium",
+  "5"  = "Mesenchyme",
+  "6"  = "Immune",
+  "7"  = "Epithelium",
+  "8"  = "Endothelium",
+  "9"  = "Epithelium",
+  "10" = "Immune",
+  "11" = "Epithelium",
+  "12" = "Epithelium",
+  "13" = "Immune",
+  "14" = "Epithelium",
+  "15" = "Immune",
+  "16" = "Endothelium",
+  "17" = "Epithelium",
+  "18" = "Endothelium",
+  "19" = "Epithelium",
+  "20" = "Epithelium",
+  "21" = "Epithelium",
+  "22" = "Mesenchyme",
+  "23" = "Mesenchyme",
+  "24" = "Epithelium",
+  "25" = "Mesenchyme",
+  "26" = "Mesenchyme",
+  "27" = "Epithelium",
+  "28" = "Epithelium"
+)
+
+TF_pediatric_nuc_subset@meta.data$lineage_lvl1 <- cluster_to_lineage_ped[
+  as.character(TF_pediatric_nuc_subset$seurat_clusters)
+]
+```
+
+```{r visualize-pediatric-lineage}
+DimPlot(TF_pediatric_nuc_subset, group.by = "lineage_lvl1", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pediatric – Lineage")
+```
+
+------------------------------------------------------------------------
+
+# Joint Fetal–Pediatric Integration (All Cell Types)
+
+> Two parallel workflows exist for joint integration:
+>
+> -   **Pre-merge epithelial approach** (`TF_fetal_pediatric_epi_pre`):
+>     Epithelium is subset from each individual object *before* merging,
+>     then the epithelial cells are merged and integrated together.
+> -   **Post-merge epithelial approach**
+>     (`TF_fetal_pediatric_epi_post`): All cell types are merged and
+>     integrated first into `TF_fetal_pediatric`, then epithelium is
+>     subset from the joint object.
+>
+> Both objects are produced below. Downstream alveolar analyses use
+> dedicated `_pre_alve` and `_post_alve` objects derived from these.
+
+## Merge + Integrate All Cell Types → `TF_fetal_pediatric`
+
+```{r integrate-joint-all}
+# Merge fetal and downsampled pediatric objects
+TF_fetal_pediatric <- merge(TF_fetal_nuc, TF_pediatric_nuc_subset)
+DefaultAssay(TF_fetal_pediatric) <- "RNA"
+
+# Join then re-split by batch for RPCA
+TF_fetal_pediatric <- JoinLayers(TF_fetal_pediatric)
+TF_fetal_pediatric[["RNA"]] <- split(
+  TF_fetal_pediatric[["RNA"]],
+  f = TF_fetal_pediatric$batch
+)
+
+TF_fetal_pediatric <- SCTransform(
+  TF_fetal_pediatric,
+  vars.to.regress = "percent.mt",
+  verbose = FALSE
+)
+TF_fetal_pediatric <- RunPCA(TF_fetal_pediatric, dims = 1:30, verbose = FALSE)
+
+TF_fetal_pediatric <- IntegrateLayers(
+  object               = TF_fetal_pediatric,
+  method               = RPCAIntegration,
+  normalization.method = "SCT",
+  verbose              = FALSE
+)
+
+TF_fetal_pediatric[["RNA"]] <- JoinLayers(TF_fetal_pediatric[["RNA"]])
+
+TF_fetal_pediatric <- FindNeighbors(
+  TF_fetal_pediatric, dims = 1:30, reduction = "integrated.dr", verbose = FALSE
+)
+TF_fetal_pediatric <- FindClusters(TF_fetal_pediatric, resolution = 0.5)
+TF_fetal_pediatric <- RunUMAP(
+  TF_fetal_pediatric, dims = 1:30, reduction = "integrated.dr"
+)
+```
+
+```{r save-joint-initial}
+# Save before annotation so this integration step is not lost
+saveRDS(TF_fetal_pediatric, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_cluster.rds")
+```
+
+```{r visualize-joint-umap}
+DimPlot(TF_fetal_pediatric, reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal+Pediatric – Clusters")
+
+DimPlot(TF_fetal_pediatric, group.by = "batch", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal+Pediatric – Batch")
+
+DimPlot(TF_fetal_pediatric, group.by = "sex", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal+Pediatric – Sex")
+
+DimPlot(TF_fetal_pediatric, group.by = "group", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal+Pediatric – Group")
+
+DimPlot(TF_fetal_pediatric, group.by = "TF_annotation_lvl3", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal+Pediatric – TF Annotation lvl3")
+
+DimPlot(TF_fetal_pediatric, group.by = "TF_annotation", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Fetal+Pediatric – TF Annotation")
+```
+
+## Annotate Joint Object: Cell Type and Lineage
+
+```{r annotate-joint-celltype}
+# Store cluster IDs in metadata for convenience
+TF_fetal_pediatric$cluster <- Idents(TF_fetal_pediatric)
+
+# Fine-grained cell-type annotation
+# NOTE: Based on marker analysis (see Section 7). Update if clusters are re-resolved.
+cluster_to_celltype <- c(
+  "0"  = "Fibroblast_1",
+  "1"  = "Fibroblast_2",
+  "2"  = "AT2_1",
+  "3"  = "AT1_1",
+  "4"  = "AT1_2",
+  "5"  = "AT2_2",
+  "6"  = "Fibroblast_3",
+  "7"  = "Macrophage_1",
+  "8"  = "LAP",
+  "9"  = "Multiciliated",
+  "10" = "AT2_3",
+  "11" = "Endothelial_1",
+  "12" = "Transitional AT2",
+  "13" = "Fibroblast_4",
+  "14" = "T-cell",
+  "15" = "Low-quality/Dying/doublets",
+  "16" = "Macrophage_2",
+  "17" = "Endothelial_2 (Capillary Aerocyte)",
+  "18" = "Endothelial_3 (Lymphatic Endothelial)",
+  "19" = "Monocytes",
+  "20" = "Endothelial_4 (Pericyte)",
+  "21" = "AT1_3",
+  "22" = "Fibroblast_4",
+  "23" = "Basal",
+  "24" = "Neutrophils",
+  "25" = "B-cell",
+  "26" = "Neuroendocrine",
+  "27" = "Unknown",
+  "28" = "Endothelial_5"
+)
+
+TF_fetal_pediatric@meta.data$cell_type <- cluster_to_celltype[
+  as.character(TF_fetal_pediatric$cluster)
+]
+```
+
+```{r annotate-joint-lineage}
+# Broad lineage assignment for joint object → stored as lineage_lvl2
+# NOTE: Used downstream to subset epithelial cells from this joint object
+cluster_to_lineage_joint <- c(
+  "0"  = "Mesenchyme",
+  "1"  = "Epithelium",
+  "2"  = "Epithelium",
+  "3"  = "Epithelium",
+  "4"  = "Epithelium",
+  "5"  = "Mesenchyme",
+  "6"  = "Epithelium",
+  "7"  = "Immune",
+  "8"  = "Mesenchyme",
+  "9"  = "Endothelium",
+  "10" = "Epithelium",
+  "11" = "Mesenchyme",
+  "12" = "Epithelium",
+  "13" = "Immune",
+  "14" = "Epithelium",
+  "15" = "Epithelium",
+  "16" = "Epithelium",
+  "17" = "Endothelium",
+  "18" = "Immune",
+  "19" = "Endothelium",
+  "20" = "Mesenchyme",
+  "21" = "Endothelium",
+  "22" = "Epithelium",
+  "23" = "Immune",
+  "24" = "Immune",
+  "25" = "Epithelium",
+  "26" = "Epithelium"
+)
+
+TF_fetal_pediatric@meta.data$lineage_lvl2 <- cluster_to_lineage_joint[
+  as.character(TF_fetal_pediatric$cluster)
+]
+```
+
+```{r visualize-joint-annotated, fig.height=15, fig.width=30}
+# UMAP labeled by lineage
+p_lin <- DimPlot(
+  TF_fetal_pediatric, group.by = "lineage_lvl2",
+  label = FALSE, repel = TRUE, raster = FALSE
+) + ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16, face = "bold"))
+LabelClusters(plot = p_lin, id = "lineage_lvl2", size = 6)
+
+# UMAP labeled by cell type
+p_ct <- DimPlot(
+  TF_fetal_pediatric, group.by = "cell_type",
+  label = FALSE, repel = TRUE, raster = FALSE
+) + ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18),
+        legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_ct, id = "cell_type", size = 7)
+```
+
+```{r tf-annotation-crosswalk-joint}
+# Summarize dominant TF_annotation_lvl1 per cluster (used to aid annotation)
+top_annotations <- TF_fetal_pediatric@meta.data %>%
+  filter(!is.na(TF_annotation_lvl1)) %>%
+  group_by(cluster, TF_annotation_lvl1) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  slice_max(order_by = percentage, n = 1, with_ties = FALSE) %>%
+  arrange(as.numeric(as.character(cluster)))
+
+top_annotations
+```
+
+```{r save-joint-annotated}
+# Save annotated joint object
+saveRDS(TF_fetal_pediatric, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_cluster.rds")
+```
+
+------------------------------------------------------------------------
+
+# Epithelial Subsetting and Re-integration
+
+> Two complementary epithelial objects are built here. Both are kept for
+> downstream comparison.
+
+## Approach A (Pre-merge): Subset from Individual Objects, Then Merge
+
+> Epithelium is cleaned from each individual object before joint
+> integration, providing a potentially cleaner separation of
+> contaminants per dataset.
+
+```{r subset-epi-pre-individuals}
+DefaultAssay(TF_fetal_nuc)          <- "RNA"
+DefaultAssay(TF_pediatric_nuc_subset) <- "RNA"
+
+# Contaminant exclusion markers:
+#   CLDN5, VWF, PECAM1 = endothelial
+#   PTPRC             = immune (CD45)
+#   COL1A2, PDGFRA    = mesenchymal / fibroblast
+TF_fetal_epi <- subset(
+  TF_fetal_nuc,
+  subset = lineage_lvl1 == "Epithelium" &
+           CLDN5  < 0.1 & VWF    < 0.1 &
+           PTPRC  < 0.1 & COL1A2 < 0.1 &
+           PECAM1 < 0.1 & PDGFRA < 0.1
+)
+
+TF_pediatric_epi <- subset(
+  TF_pediatric_nuc_subset,
+  subset = lineage_lvl1 == "Epithelium" &
+           CLDN5  < 0.1 & VWF    < 0.1 &
+           PTPRC  < 0.1 & COL1A2 < 0.1 &
+           PECAM1 < 0.1 & PDGFRA < 0.1
+)
+
+cat("Fetal epithelial cells:", ncol(TF_fetal_epi), "\n")
+cat("Pediatric epithelial cells:", ncol(TF_pediatric_epi), "\n")
+```
+
+```{r integrate-epi-pre}
+# Merge cleaned epithelial subsets and integrate
+TF_fetal_pediatric_epi_pre <- merge(TF_fetal_epi, TF_pediatric_epi)
+DefaultAssay(TF_fetal_pediatric_epi_pre) <- "RNA"
+TF_fetal_pediatric_epi_pre <- JoinLayers(TF_fetal_pediatric_epi_pre)
+TF_fetal_pediatric_epi_pre[["RNA"]] <- split(
+  TF_fetal_pediatric_epi_pre[["RNA"]],
+  f = TF_fetal_pediatric_epi_pre$batch
+)
+
+TF_fetal_pediatric_epi_pre <- SCTransform(
+  TF_fetal_pediatric_epi_pre, vars.to.regress = "percent.mt", verbose = FALSE
+)
+TF_fetal_pediatric_epi_pre <- RunPCA(TF_fetal_pediatric_epi_pre, dims = 1:30, verbose = FALSE)
+
+TF_fetal_pediatric_epi_pre <- IntegrateLayers(
+  object               = TF_fetal_pediatric_epi_pre,
+  method               = RPCAIntegration,
+  normalization.method = "SCT",
+  verbose              = FALSE
+)
+TF_fetal_pediatric_epi_pre[["RNA"]] <- JoinLayers(TF_fetal_pediatric_epi_pre[["RNA"]])
+
+TF_fetal_pediatric_epi_pre <- FindNeighbors(
+  TF_fetal_pediatric_epi_pre, dims = 1:30, reduction = "integrated.dr", verbose = FALSE
+)
+TF_fetal_pediatric_epi_pre <- FindClusters(TF_fetal_pediatric_epi_pre, resolution = 0.5)
+TF_fetal_pediatric_epi_pre <- RunUMAP(
+  TF_fetal_pediatric_epi_pre, dims = 1:30, reduction = "integrated.dr"
+)
+```
+
+```{r save-epi-pre-clustered}
+saveRDS(TF_fetal_pediatric_epi_pre, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_pre.rds")
+```
+
+```{r visualize-epi-pre}
+DimPlot(TF_fetal_pediatric_epi_pre, reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Pre – Clusters")
+
+DimPlot(TF_fetal_pediatric_epi_pre, group.by = "batch", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Pre – Batch")
+
+DimPlot(TF_fetal_pediatric_epi_pre, group.by = "sex", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Pre – Sex")
+
+DimPlot(TF_fetal_pediatric_epi_pre, group.by = "group", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Pre – Group")
+
+DimPlot(TF_fetal_pediatric_epi_pre, group.by = "TF_annotation", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Pre – TF Annotation")
+```
+
+## Approach B (Post-merge): Subset Epithelium from Joint Object
+
+> Epithelium is extracted from the fully integrated `TF_fetal_pediatric`
+> object. The `lineage_lvl2` column must be present (assigned in Section
+> 4).
+
+```{r subset-epi-post}
+# NOTE: contaminant gene filters were applied in Approach A but not replicated here.
+# The lineage_lvl2 annotation is used as the primary filter.
+# FLAGGED: Original code had bare expression `CLDN5 < 0.1 & ...` on its own line
+#          without assignment — those filters were not applied. Retaining as-is.
+TF_fetal_pediatric_epi_post <- subset(
+  TF_fetal_pediatric,
+  subset = lineage_lvl2 == "Epithelium" &
+           CLDN5  < 0.1 & VWF    < 0.1 &
+           PTPRC  < 0.1 & COL1A2 < 0.1 &
+           PECAM1 < 0.1 & PDGFRA < 0.1
+)
+
+cat("Post-merge epithelial cells:", ncol(TF_fetal_pediatric_epi_post), "\n")
+```
+
+```{r integrate-epi-post}
+TF_fetal_pediatric_epi_post <- SCTransform(
+  TF_fetal_pediatric_epi_post, vars.to.regress = "percent.mt", verbose = FALSE
+)
+TF_fetal_pediatric_epi_post <- RunPCA(TF_fetal_pediatric_epi_post, dims = 1:30, verbose = FALSE)
+
+TF_fetal_pediatric_epi_post <- IntegrateLayers(
+  object               = TF_fetal_pediatric_epi_post,
+  method               = RPCAIntegration,
+  normalization.method = "SCT",
+  verbose              = FALSE
+)
+TF_fetal_pediatric_epi_post[["RNA"]] <- JoinLayers(TF_fetal_pediatric_epi_post[["RNA"]])
+
+TF_fetal_pediatric_epi_post <- FindNeighbors(
+  TF_fetal_pediatric_epi_post, dims = 1:30, reduction = "integrated.dr", verbose = FALSE
+)
+TF_fetal_pediatric_epi_post <- FindClusters(TF_fetal_pediatric_epi_post, resolution = 0.5)
+TF_fetal_pediatric_epi_post <- RunUMAP(
+  TF_fetal_pediatric_epi_post, dims = 1:30, reduction = "integrated.dr"
+)
+```
+
+```{r save-epi-post-clustered}
+saveRDS(TF_fetal_pediatric_epi_post, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_post.rds")
+```
+
+```{r visualize-epi-post}
+DimPlot(TF_fetal_pediatric_epi_post, reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Post – Clusters")
+
+DimPlot(TF_fetal_pediatric_epi_post, group.by = "batch", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Post – Batch")
+
+DimPlot(TF_fetal_pediatric_epi_post, group.by = "sex", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Post – Sex")
+
+DimPlot(TF_fetal_pediatric_epi_post, group.by = "group", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Post – Group")
+
+DimPlot(TF_fetal_pediatric_epi_post, group.by = "TF_annotation", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Post – TF Annotation")
+
+DimPlot(TF_fetal_pediatric_epi_post, group.by = "TF_annotation_lvl3", reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Epi Post – TF Annotation lvl3")
+```
+
+```{r save-epi-objects}
+saveRDS(TF_fetal_pediatric_epi_pre,  file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_pre.rds")
+saveRDS(TF_fetal_pediatric_epi_post, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_post.rds")
+```
+
+## Epithelial Object Marker Analysis and Cluster Annotation
+
+```{r epi-markers}
+# Find top markers per cluster using fast Wilcoxon test
+res_epi <- wilcoxauc(TF_fetal_pediatric_epi_post, seurat_assay = "RNA")
+top_markers_epi <- top_markers(res_epi, n = 10)
+top_markers_epi
+```
+
+```{r epi-tf-annotation-crosswalk}
+# Compare new clusters to TF_annotation_lvl3 to guide cell type assignment
+TF_fetal_pediatric_epi_post$cluster <- Idents(TF_fetal_pediatric_epi_post)
+
+# Dominant TF annotation per cluster
+top_annotations_epi <- TF_fetal_pediatric_epi_post@meta.data %>%
+  filter(!is.na(TF_annotation_lvl3)) %>%
+  group_by(cluster, TF_annotation_lvl3) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  slice_max(order_by = percentage, n = 1, with_ties = FALSE) %>%
+  arrange(as.numeric(as.character(cluster)))
+
+top_annotations_epi
+
+# Dominant cluster per TF annotation
+top_clusters_epi <- TF_fetal_pediatric_epi_post@meta.data %>%
+  filter(!is.na(TF_annotation_lvl3)) %>%
+  group_by(TF_annotation_lvl3, cluster) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(TF_annotation_lvl3) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  slice_max(order_by = percentage, n = 1, with_ties = FALSE) %>%
+  arrange(TF_annotation_lvl3)
+
+top_clusters_epi
+```
+
+```{r annotate-epi-celltype}
+# Fine-grained cell type annotation for epithelial object
+# NOTE: Update based on marker review and TF annotation crosswalk above
+cluster_to_celltype_epi <- c(
+  "0"  = "AT2_1",
+  "1"  = "AT1_1",
+  "2"  = "LAP_1",
+  "3"  = "AT1_2",
+  "4"  = "AT2_2",
+  "5"  = "Transitional_1",
+  "6"  = "Multiciliated",
+  "7"  = "AT2_3",
+  "8"  = "LAP_2",
+  "9"  = "Transitional_2",
+  "10" = "Endothelial_1",
+  "11" = "Endothelial_2",
+  "12" = "AT1_3",
+  "13" = "Basal",
+  "14" = "Macrophages",
+  "15" = "Neuroendocrine"
+)
+
+TF_fetal_pediatric_epi_post@meta.data$cell_type2 <- cluster_to_celltype_epi[
+  as.character(TF_fetal_pediatric_epi_post$cluster)
+]
+```
+
+```{r visualize-epi-annotated, fig.height=12, fig.width=24}
+p_epi <- DimPlot(
+  TF_fetal_pediatric_epi_post, group.by = "cell_type2",
+  label = FALSE, repel = TRUE, raster = FALSE
+) + ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18),
+        legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_epi, id = "cell_type2", size = 7)
+
+p_tf3 <- DimPlot(
+  TF_fetal_pediatric_epi_post, group.by = "TF_annotation_lvl3",
+  label = FALSE, repel = TRUE, raster = FALSE
+) + ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18),
+        legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_tf3, id = "TF_annotation_lvl3", size = 7)
+```
+
+```{r epi-feature-plot}
+# Bud tip and alveolar progenitor markers
+FeaturePlot(
+  TF_fetal_pediatric_epi_post,
+  features = c("SOX9", "TESC", "NPC2", "FGF20", "SOX11"),
+  ncol = 3
+)
+```
+
+------------------------------------------------------------------------
+
+# Alveolar Lineage Subsetting
+
+> The alveolar lineage (Bud Tip, AT2, Transitional, AT1) is isolated
+> from the epithelial objects for trajectory and cell–cell communication
+> analysis. Two versions exist: `_pre_alve` (from Approach A) and
+> `_post_alve` (from Approach B). Both are loaded from previously saved
+> files here.
+
+## Load Pre-computed Alveolar Subset Objects
+
+```{r load-alveolar-objects}
+# Load fully processed alveolar subset objects
+# These were built and saved from a prior analysis session
+TF_Alve_subset <- readRDS(
+  "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/20260106/TF_Alve_subset_cluster_v2.rds"
+)
+
+TF_fetal_pediatric_epi_post_alve <- readRDS(
+  "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/20260217/TF_fetal_pediatric_epi_post_alve.rds"
+)
+
+TF_fetal_pediatric_epi_pre_alve <- readRDS(
+  "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/20260217/TF_fetal_pediatric_epi_pre_alve.rds"
+)
+```
+
+## Build Alveolar Subset from Scratch (Optional — Skip if Loading Above)
+
+> **OPTIONAL BLOCK.** Run this section only if the `.rds` files above
+> are unavailable. This subsets alveolar cell types from
+> `TF_fetal_pediatric_epi_post` and re-integrates.
+
+```{r build-alveolar-from-scratch, eval=FALSE}
+# Cell types to retain for alveolar trajectory analysis
+cell_types_to_keep <- c(
+  "AT1_1", "AT1_2", "AT1_3", "AT1_4",
+  "AT2_1", "AT2_2", "AT2_3", "AT2_4",
+  "Bud Tip", "Transitional"
+)
+
+TF_Alve_subset <- subset(
+  TF_fetal_pediatric_epi_post,
+  subset = cell_type2 %in% cell_types_to_keep
+)
+
+# Re-integrate the alveolar subset
+TF_Alve_subset <- SCTransform(TF_Alve_subset, vars.to.regress = "percent.mt", verbose = FALSE)
+TF_Alve_subset <- RunPCA(TF_Alve_subset, dims = 1:30, verbose = FALSE)
+TF_Alve_subset <- FindNeighbors(TF_Alve_subset, dims = 1:30, reduction = "integrated.dr", verbose = FALSE)
+TF_Alve_subset <- FindClusters(TF_Alve_subset, resolution = 0.5)
+TF_Alve_subset <- RunUMAP(TF_Alve_subset, dims = 1:30, reduction = "integrated.dr")
+```
+
+## Annotate Alveolar Clusters
+
+```{r annotate-alveolar-celltype2}
+# cell_type2: detailed cluster annotation including Transitional/Bud Tip Adjacent
+cluster_to_celltype2_alve <- c(
+  "0"  = "AT2_1",
+  "1"  = "AT1_1",
+  "2"  = "Transitional/Bud Tip Adjacent",
+  "3"  = "AT2_3",
+  "4"  = "AT1_2",
+  "5"  = "AT2_2",
+  "6"  = "AT1_5",
+  "7"  = "AT2_4",
+  "8"  = "Bud Tip",
+  "9"  = "AT1_3",
+  "10" = "AT1_4"
+)
+
+TF_Alve_subset@meta.data$cell_type2 <- cluster_to_celltype2_alve[
+  as.character(TF_Alve_subset$SCT_snn_res.0.5)
+]
+```
+
+```{r annotate-alveolar-celltype3}
+# cell_type3: alternative annotation collapsing Transitional/Bud Tip Adjacent
+# Used in CellChat and tradeSeq downstream
+cluster_to_celltype3_alve <- c(
+  "0"  = "AT2_1",
+  "1"  = "AT1_1",
+  "2"  = "AT2_2",
+  "3"  = "AT2_3",
+  "4"  = "AT1_2",
+  "5"  = "Transitional",
+  "6"  = "Bud Tip",
+  "7"  = "AT1_5",
+  "8"  = "AT2_4",
+  "9"  = "AT1_3",
+  "10" = "AT1_4"
+)
+
+TF_Alve_subset@meta.data$cell_type3 <- cluster_to_celltype3_alve[
+  as.character(TF_Alve_subset$SCT_snn_res.0.5)
+]
+```
+
+```{r annotate-prealve-celltype2}
+# Cell type annotation for the pre-merge alveolar object (16 clusters at res 0.6)
+cluster_to_celltype2_pre <- c(
+  "0"  = "AT2_1",
+  "1"  = "Bud Tip",
+  "2"  = "AT1_1",
+  "3"  = "AT1_2",
+  "4"  = "AT1_3",
+  "5"  = "AT2_2",
+  "6"  = "AT2_3",
+  "7"  = "AT2_4",
+  "8"  = "Transitional_1",
+  "9"  = "Transitional_2",
+  "10" = "Transitional_3",
+  "11" = "Transitional_4",
+  "12" = "AT1_5",
+  "13" = "AT2_6",
+  "14" = "AT2_7",
+  "15" = "AT1_6"
+)
+
+TF_fetal_pediatric_epi_pre_alve@meta.data$cell_type2 <- cluster_to_celltype2_pre[
+  as.character(TF_fetal_pediatric_epi_pre_alve$seurat_clusters)
+]
+```
+
+```{r annotate-postalve-celltype2}
+# Cell type annotation for post-merge alveolar object (9 clusters)
+cluster_to_celltype2_post <- c(
+  "0" = "AT2_1",
+  "1" = "AT1_1",
+  "2" = "AT2_2",
+  "3" = "Transitional_1",
+  "4" = "AT1_2",
+  "5" = "Transitional_2",
+  "6" = "AT2_4",
+  "7" = "Bud Tip",
+  "8" = "AT2_5"
+)
+
+TF_fetal_pediatric_epi_post_alve@meta.data$cell_type2 <- cluster_to_celltype2_post[
+  as.character(TF_fetal_pediatric_epi_post_alve$seurat_clusters)
+]
+```
+
+```{r save-alveolar-object}
+saveRDS(TF_Alve_subset, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_Alve_subset_cluster_v2.rds")
+```
+
+------------------------------------------------------------------------
+
+# Visualization of Alveolar Objects
+
+## UMAP by Metadata Variables
+
+```{r visualize-alve-dimplots, fig.height=8, fig.width=15}
+# TF_Alve_subset — cell_type2, cell_type3, group
+p_ct2 <- DimPlot(TF_Alve_subset, group.by = "cell_type2", label = FALSE, repel = TRUE, raster = FALSE) +
+  ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_ct2, id = "cell_type2", size = 7)
+
+p_ct3 <- DimPlot(TF_Alve_subset, group.by = "cell_type3", label = FALSE, repel = TRUE, raster = FALSE) +
+  ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_ct3, id = "cell_type3", size = 7)
+
+p_grp <- DimPlot(TF_Alve_subset, group.by = "group", label = FALSE, repel = TRUE, raster = FALSE) +
+  ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_grp, id = "group", size = 7)
+```
+
+```{r visualize-prealve-dimplots, fig.height=8, fig.width=15}
+# Pre-merge alveolar UMAP: group and cell_type2
+p_pre_grp <- DimPlot(TF_fetal_pediatric_epi_pre_alve, group.by = "group",
+                     label = FALSE, repel = TRUE, raster = FALSE) +
+  ggtitle(NULL) + theme_void() +
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size = 24, face = "bold"))
+LabelClusters(plot = p_pre_grp, id = "group", size = 7)
+
+DimPlot(TF_fetal_pediatric_epi_pre_alve, group.by = "cell_type2",
+        reduction = "umap", label = FALSE, raster = FALSE) +
+  theme_void() + ggtitle("Pre-alve – cell_type2")
+```
+
+## Age Gradient UMAP (Fetal = Purple, Pediatric = Orange)
+
+```{r visualize-age-gradient, fig.height=8, fig.width=12}
+# Dual-palette UMAP separating fetal (purple) and pediatric (orange) age gradients
+meta <- TF_fetal_pediatric_epi_post_alve@meta.data %>% tibble::rownames_to_column("cell")
+umap_df <- Embeddings(TF_fetal_pediatric_epi_post_alve, "umap") %>%
+  as.data.frame() %>% tibble::rownames_to_column("cell")
+plot_df <- dplyr::left_join(umap_df, meta, by = "cell") %>%
+  dplyr::filter(group %in% c("fetal", "pediatric"), !is.na(age_days))
+
+p_age <- ggplot() +
+  geom_point(
+    data = dplyr::filter(plot_df, group == "fetal"),
+    aes(umap_1, umap_2, color = age_days), size = 0.5
+  ) +
+  scale_color_gradientn(
+    colors = brewer.pal(9, "Purples"), name = "Fetal Age (days)",
+    limits = range(dplyr::filter(plot_df, group == "fetal")$age_days, na.rm = TRUE),
+    na.value = "transparent"
+  ) +
+  ggnewscale::new_scale_color() +
+  geom_point(
+    data = dplyr::filter(plot_df, group == "pediatric"),
+    aes(umap_1, umap_2, color = age_days), size = 0.5
+  ) +
+  scale_color_gradientn(
+    colors = brewer.pal(9, "Oranges"), name = "Pediatric Age (days)",
+    limits = range(dplyr::filter(plot_df, group == "pediatric")$age_days, na.rm = TRUE),
+    na.value = "transparent"
+  ) +
+  theme_void() +
+  theme(legend.text = element_text(size = 16), legend.title = element_text(size = 18, face = "bold"))
+
+pdf("UMAP_post.pdf", width = 8, height = 4, useDingbats = FALSE)
+print(p_age)
+dev.off()
+
+p_age
+```
+
+```{r visualize-age-gradient-overlap}
+# Alternative: both groups overlaid with classic theme
+p_overlap <- ggplot() +
+  geom_point(data = filter(plot_df, group == "fetal"),
+             aes(umap_1, umap_2, color = age_days), size = 0.35, alpha = 0.4, stroke = 0) +
+  scale_color_gradientn(colors = RColorBrewer::brewer.pal(9, "Purples"),
+                        name = "Fetal Age (days)", limits = range(plot_df$age_days)) +
+  ggnewscale::new_scale_color() +
+  geom_point(data = filter(plot_df, group == "pediatric"),
+             aes(umap_1, umap_2, color = age_days), size = 0.5, alpha = 0.9) +
+  scale_color_gradientn(colors = RColorBrewer::brewer.pal(9, "Oranges"),
+                        name = "Pediatric Age (days)", limits = range(plot_df$age_days)) +
+  theme_classic() +
+  labs(title = "UMAP: Age Gradient in Fetal and Pediatric Groups")
+
+pdf("UMAP_fetal_pediatric_overlap_tamed.pdf", width = 12, height = 8, useDingbats = FALSE)
+print(p_overlap); dev.off()
+p_overlap
+```
+
+```{r visualize-age-highlight, fig.height=8, fig.width=12}
+# Highlight a specific age group (103 days) to inspect batch distribution
+meta_alve <- TF_Alve_subset@meta.data %>% rownames_to_column("cell")
+umap_alve  <- Embeddings(TF_Alve_subset, "umap") %>%
+  as.data.frame() %>% rownames_to_column("cell")
+plot_df_alve <- left_join(umap_alve, meta_alve, by = "cell") %>%
+  mutate(age_highlight = ifelse(age == "103 days", "103 days", "other"))
+
+ggplot(plot_df_alve, aes(x = umap_1, y = umap_2, color = age_highlight)) +
+  geom_point(size = 0.3) +
+  scale_color_manual(values = c("103 days" = "blue", "other" = "gray80"), name = "Age") +
+  theme_classic() +
+  labs(title = "UMAP: Highlighting '103 days'")
+```
+
+## FeaturePlot: Canonical Alveolar Markers
+
+```{r gene-sets-definition}
+# Canonical marker gene sets for alveolar and epithelial cell types
+gene_sets <- list(
+  AT2        = c("SFTPC", "SFTPB", "SFTPA1", "SFTPA2", "LAMP3", "NAPSA"),
+  AT1        = c("AGER", "CAV1", "EMP2", "PDPN"),
+  Basal      = c("TP63", "KRT5"),
+  LAP        = c("SCGB3A2", "CP", "CFTR"),
+  BudTip     = c("SOX9", "TESC", "CPM", "ETV5", "NPC2"),
+  Ciliated   = c("FOXJ1", "CAPS", "SNTN"),
+  Fibroblasts = c("COL3A1", "FBN1", "LUM"),
+  Endo       = c("CD34", "PECAM1", "VWF"),
+  Club       = c("BPIFB1", "CYP4B1", "SCGB3A1", "MUC15"),
+  SmoothMuscle = c("ACTA2", "ACTG2", "CNN1", "MYH11"),
+  PNEC       = c("CHGA", "ASCL1"),
+  Alve       = c("SFTPC", "SFTPB", "LAMP3", "NAPSA", "SOX9", "TESC", "AGER", "PDPN")
+)
+```
+
+```{r featureplot-alve-post, fig.height=12, fig.width=10}
+DefaultAssay(TF_fetal_pediatric_epi_post_alve) <- "SCT"
+
+group_name <- "Alve"
+genes      <- gene_sets[[group_name]]
+
+plots <- FeaturePlot(TF_fetal_pediatric_epi_post_alve, features = genes,
+                     pt.size = 0.2, raster = FALSE, combine = FALSE)
+plots <- lapply(seq_along(plots), function(i) {
+  plots[[i]] + my_colors + theme_void() + ggtitle(genes[i]) +
+    theme(plot.title = element_text(hjust = 0.5, size = 12))
+})
+wrap_plots(plots, ncol = 2) +
+  plot_annotation(title = paste(group_name, "Markers"),
+                  theme = theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold")))
+```
+
+```{r featureplot-alve-subset, fig.height=6, fig.width=16}
+DefaultAssay(TF_Alve_subset) <- "SCT"
+
+genes_alve <- c("SFTPC", "SFTPB", "LAMP3", "NAPSA", "SOX9", "TESC", "AGER", "PDPN")
+plots2 <- FeaturePlot(TF_Alve_subset, features = genes_alve,
+                      pt.size = 0.2, raster = FALSE, combine = FALSE)
+plots2 <- lapply(seq_along(plots2), function(i) {
+  plots2[[i]] + my_colors + theme_void() + ggtitle(genes_alve[i]) +
+    theme(plot.title = element_text(hjust = 0.5, size = 24))
+})
+final_plot <- wrap_plots(plots2, ncol = 2)
+
+pdf("FeaturePlots_genes.pdf", width = 10, height = 12, useDingbats = FALSE)
+print(final_plot); dev.off()
+final_plot
+```
+
+```{r featureplot-prealve-cftr, fig.height=4, fig.width=10}
+# Check LAP markers in post_alve
+FeaturePlot(TF_fetal_pediatric_epi_post_alve, c("FMO5", "CFTR"))
+```
+
+## VlnPlot and RidgePlot
+
+```{r vlnplot-alve}
+VlnPlot(TF_Alve_subset, features = "SFTPC", alpha = 0.5, raster = FALSE) + NoLegend()
+```
+
+```{r ridgeplot-alve, fig.height=8, fig.width=12}
+RidgePlot(TF_Alve_subset, features = "SFTPC")
+```
+
+## DotPlot: Alveolar Genes of Interest
+
+```{r dotplot-alve, fig.height=10, fig.width=20}
+genes_of_interest <- c(
+  "SOX9","TESC","CPM","ETV5","NPC2",
+  "SFTPC","SFTPB","SFTPA1","SFTPA2","LAMP3","NAPSA",
+  "AGER","CAV1","EMP2","PDPN",
+  "SCGB3A2","CP","CFTR"
+)
+
+dotplot_data <- FetchData(TF_fetal_pediatric_epi_pre_alve,
+                          vars = c("cell_type2", genes_of_interest)) %>%
+  pivot_longer(cols = all_of(genes_of_interest), names_to = "gene", values_to = "expression") %>%
+  group_by(cell_type2, gene) %>%
+  summarise(avg_expression = mean(expression, na.rm = TRUE),
+            pct_cells = mean(expression > 0) * 100, .groups = "drop")
+
+dotplot_data$gene <- factor(dotplot_data$gene, levels = genes_of_interest)
+
+dp <- ggplot(dotplot_data, aes(x = gene, y = cell_type2, size = pct_cells, color = avg_expression)) +
+  geom_point() +
+  scale_color_gradientn(colors = c("lightgrey","#EDF8B1","#C7E9B4","#7FCDBB",
+                                    "#41B6C4","#1D91C0","#225EA8","#253494","#081D58")) +
+  scale_size_area(max_size = 9) +
+  labs(x = "Genes", y = "Cluster", size = "% Expressing Cells",
+       color = "Avg Expression", title = "Genes of Interest") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+        axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+
+pdf("DotPlot_genes_of_interest_pre.pdf", width = 12, height = 6, useDingbats = FALSE)
+print(dp); dev.off()
+dp
+```
+
+## ComplexHeatmap: DEG Heatmap by Cell Type
+
+```{r heatmap-deg-alve, fig.height=20, fig.width=10}
+Idents(TF_Alve_subset) <- "cell_type3"
+
+# Find top markers per cell type
+deg_list <- lapply(levels(Idents(TF_Alve_subset)), function(ct) {
+  FindMarkers(TF_Alve_subset, ident.1 = ct, only.pos = TRUE,
+              min.pct = 0.25, logfc.threshold = 0.25)
+})
+names(deg_list) <- levels(Idents(TF_Alve_subset))
+
+# Top 10 genes per cell type by log2FC
+top_genes <- unique(unlist(lapply(deg_list, function(deg) {
+  if (nrow(deg) > 0) head(rownames(deg[order(deg$avg_log2FC, decreasing = TRUE), ]), 10) else NULL
+})))
+
+# Aggregate average expression per cell type
+expression_data <- FetchData(TF_Alve_subset, vars = c(top_genes, "cell_type3")) %>%
+  tidyr::pivot_longer(cols = -cell_type3, names_to = "gene", values_to = "expression")
+
+heatmap_data <- expression_data %>%
+  group_by(cell_type3, gene) %>%
+  summarise(avg_expression = mean(expression, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = cell_type3, values_from = avg_expression) %>%
+  column_to_rownames(var = "gene")
+
+scaled_data <- t(scale(t(as.matrix(heatmap_data))))
+
+DGE_heatmap <- Heatmap(
+  as.matrix(scaled_data), name = "Expression",
+  cluster_rows = TRUE, cluster_columns = TRUE,
+  row_title = "Genes", column_title = "Cell Types",
+  col = viridis::viridis(100),
+  show_row_names = TRUE, show_column_names = TRUE,
+  row_names_gp    = grid::gpar(fontsize = 6),
+  column_names_gp = grid::gpar(fontsize = 12, rot = 45),
+  heatmap_legend_param = list(
+    title = "Expression Level",
+    title_gp  = grid::gpar(fontsize = 12, fontface = "bold"),
+    labels_gp = grid::gpar(fontsize = 10)
+  )
+)
+draw(DGE_heatmap)
+```
+
+## TF Annotation Crosswalk (Alveolar Pre-alve)
+
+```{r tf-crosswalk-prealve}
+TF_fetal_pediatric_epi_pre_alve$cluster <- Idents(TF_fetal_pediatric_epi_pre_alve)
+
+# Dominant TF annotation per cluster
+top_annotations_pre <- TF_fetal_pediatric_epi_pre_alve@meta.data %>%
+  filter(!is.na(TF_annotation)) %>%
+  group_by(cluster, TF_annotation) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  slice_max(order_by = percentage, n = 1, with_ties = FALSE) %>%
+  arrange(as.numeric(as.character(cluster)))
+top_annotations_pre
+
+# Cluster composition by fetal vs pediatric
+meta_pre <- TF_fetal_pediatric_epi_pre_alve@meta.data
+cluster_counts_pre <- meta_pre %>%
+  group_by(cluster, group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = n, values_fill = 0) %>%
+  arrange(desc(fetal)) %>%
+  mutate(rank_fetal = row_number())
+cluster_counts_pre
+```
+
+------------------------------------------------------------------------
+
+# Differential Expression / Marker Analysis
+
+## Joint All-Type Object Markers
+
+```{r markers-joint}
+# Wilcoxon-based fast marker test on full joint object
+res_joint <- wilcoxauc(TF_fetal_pediatric, seurat_assay = "RNA")
+top_markers_joint <- top_markers(res_joint, n = 10)
+top_markers_joint
+```
+
+## Alveolar Subset: Bud Tip vs AT2_2
+
+```{r dge-budtip-vs-at2}
+Idents(TF_Alve_subset) <- TF_Alve_subset$cell_type3
+dge_BT_AT2 <- FindMarkers(TF_Alve_subset, ident.1 = "Bud Tip", ident.2 = "AT2_2")
+
+dge_ranked <- dge_BT_AT2 %>%
+  dplyr::filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.5, pct.1 > 0.25) %>%
+  dplyr::arrange(p_val_adj, desc(abs(avg_log2FC)))
+
+dge_ranked[1:20, ]
+```
+
+```{r featureplot-dge-top20}
+top20_dge <- rownames(dge_ranked)[1:20]
+plots_dge  <- FeaturePlot(TF_Alve_subset, features = top20_dge,
+                           reduction = "umap", ncol = 5, order = TRUE)
+ggsave("FeaturePlot_top20.pdf", plots_dge, width = 16, height = 10)
+plots_dge
+```
+
+------------------------------------------------------------------------
+
+# Slingshot Trajectory Analysis
+
+> Trajectory analysis is run on `TF_fetal_pediatric_epi_pre_alve`
+> (pre-merge approach). The start cluster is **Bud Tip**. Multiple
+> distance methods and start nodes are explored. TradeSeq GAM fitting
+> uses `TF_fetal_pediatric_epi_post_alve` counts.
+
+## Prepare Slingshot Input
+
+```{r slingshot-prep-reductions}
+# Ensure pre_alve has updated clustering at res 0.6 (using integrated.dr)
+DefaultAssay(TF_fetal_pediatric_epi_pre_alve) <- "SCT"
+
+TF_fetal_pediatric_epi_pre_alve <- FindNeighbors(
+  TF_fetal_pediatric_epi_pre_alve, dims = 1:30, reduction = "integrated.dr", verbose = FALSE
+)
+TF_fetal_pediatric_epi_pre_alve <- FindClusters(
+  TF_fetal_pediatric_epi_pre_alve, resolution = 0.6
+)
+TF_fetal_pediatric_epi_pre_alve <- RunUMAP(
+  TF_fetal_pediatric_epi_pre_alve, dims = 1:30, reduction = "integrated.dr"
+)
+
+DimPlot(TF_fetal_pediatric_epi_pre_alve)
+DimPlot(TF_fetal_pediatric_epi_pre_alve, group.by = "cell_type2")
+```
+
+```{r slingshot-extract-inputs}
+# Extract the three required inputs for Slingshot
+dimred     <- TF_fetal_pediatric_epi_pre_alve@reductions$umap@cell.embeddings
+clustering <- TF_fetal_pediatric_epi_pre_alve$cell_type2
+counts     <- GetAssayData(TF_fetal_pediatric_epi_pre_alve, assay = "RNA", layer = "counts")
+```
+
+```{r slingshot-extract-colors}
+# Extract Seurat-generated cluster colors to use in base-R Slingshot plots
+Idents(TF_fetal_pediatric_epi_pre_alve) <- "cell_type2"
+p_col <- DimPlot(TF_fetal_pediatric_epi_pre_alve, group.by = "cell_type2", label = TRUE)
+plot_build    <- ggplot_build(p_col)
+umap_colors   <- unique(plot_build$data[[1]]$colour)
+color_levels  <- levels(Idents(TF_fetal_pediatric_epi_pre_alve))
+my_colors_UMAP <- setNames(umap_colors, color_levels)
+```
+
+## Run Slingshot: Primary Lineages (Bud Tip Start, MNN Distance)
+
+```{r run-slingshot-bt-mnn}
+# Primary trajectory inference starting from Bud Tip
+lin_BT <- getLineages(
+  data = dimred, clusterLabels = clustering,
+  start.clus = "Bud Tip", dist.method = "mnn"
+)
+SlingshotDataSet(lin_BT)
+
+sds_BT <- getCurves(lin_BT, approx_points = 150, thresh = 0.01,
+                     stretch = 0.8, allow.breaks = FALSE, shrink = 0.99)
+sds_BT <- SlingshotDataSet(sds_BT)
+```
+
+```{r slingshot-plot-initial, fig.height=10, fig.width=12}
+# Quick diagnostic: plot all Bud Tip lineages
+plot(dimred[, 1:2], col = my_colors_UMAP[clustering], cex = 0.5, pch = 16,
+     xlab = "", ylab = "", xaxt = "n", yaxt = "n", axes = FALSE)
+lines(sds_BT, lwd = 5, col = adjustcolor("steelblue", alpha.f = 0.8))
+unique_clusters <- sort(unique(clustering))
+for (i in unique_clusters) {
+  cells <- which(clustering == i)
+  if (length(cells) > 0) {
+    text(mean(dimred[cells, 1]), mean(dimred[cells, 2]), labels = i, font = 2, cex = 1)
+  }
+}
+```
+
+## Slingshot: Multi-Start Comparison
+
+> Two start nodes (Bud Tip and Transitional) and two distance methods
+> (MNN and Slingshot default) are explored. Specific lineage subsets are
+> retained for final visualization.
+
+```{r slingshot-transitional2-mnn}
+# Secondary start: Transitional_2 (MNN)
+lin_T2 <- getLineages(
+  data = dimred, clusterLabels = clustering,
+  start.clus = "Transitional_2", dist.method = "mnn"
+)
+sds_T2 <- getCurves(lin_T2, approx_points = 150, thresh = 0.01,
+                     stretch = 0.8, allow.breaks = FALSE, shrink = 0.99)
+sds_T2 <- SlingshotDataSet(sds_T2)
+
+# Retain only lineage 4 from Transitional_2 run
+sds_T2_sub           <- sds_T2
+sds_T2_sub@lineages  <- sds_T2@lineages[4]
+sds_T2_sub@curves    <- sds_T2@curves[4]
+names(sds_T2_sub@lineages) <- names(sds_T2_sub@curves)
+```
+
+```{r slingshot-bt-slingshot-dist}
+# Alternative: Bud Tip start with Slingshot default distance
+lin_BT2 <- getLineages(
+  data = dimred, clusterLabels = clustering,
+  start.clus = "Bud Tip", dist.method = "slingshot"
+)
+sds_BT2 <- getCurves(lin_BT2, approx_points = 150, thresh = 0.01,
+                      stretch = 0.8, allow.breaks = FALSE, shrink = 0.99)
+sds_BT2 <- SlingshotDataSet(sds_BT2)
+
+# Keep lineages 2 and 3
+keep_BT2 <- c(2, 3)
+sds_BT2_sub           <- sds_BT2
+sds_BT2_sub@lineages  <- sds_BT2@lineages[keep_BT2]
+sds_BT2_sub@curves    <- sds_BT2@curves[keep_BT2]
+names(sds_BT2_sub@lineages) <- names(sds_BT2_sub@curves)
+```
+
+```{r slingshot-transitional1-slingshot-dist}
+# Secondary: Transitional_1 start with Slingshot default distance
+lin_T1 <- getLineages(
+  data = dimred, clusterLabels = clustering,
+  start.clus = "Transitional_1", dist.method = "slingshot"
+)
+sds_T1 <- getCurves(lin_T1, approx_points = 150, thresh = 0.01,
+                     stretch = 0.8, allow.breaks = FALSE, shrink = 0.99)
+sds_T1 <- SlingshotDataSet(sds_T1)
+
+# Keep lineage 3
+sds_T1_sub           <- sds_T1
+sds_T1_sub@lineages  <- sds_T1@lineages[3]
+sds_T1_sub@curves    <- sds_T1@curves[3]
+names(sds_T1_sub@lineages) <- names(sds_T1_sub@curves)
+```
+
+## Slingshot Lineage Plots (PDF Export)
+
+```{r plot-slingshot-lineages-mnn}
+pdf("Slingshot_lineages_post.pdf", width = 12, height = 10, useDingbats = FALSE)
+plot(dimred[, 1:2], col = my_colors_UMAP[as.character(clustering)],
+     cex = 0.5, pch = 16, xlab = "", ylab = "", xaxt = "n", yaxt = "n", axes = FALSE)
+
+# Bud Tip MNN lineages 1,3,4 (maroon)
+sds_BT_sub           <- sds_BT
+sds_BT_sub@lineages  <- sds_BT@lineages[c(1, 3, 4)]
+sds_BT_sub@curves    <- sds_BT@curves[c(1, 3, 4)]
+names(sds_BT_sub@lineages) <- names(sds_BT_sub@curves)
+lines(sds_BT_sub, lwd = 5, col = adjustcolor("maroon",   alpha.f = 0.8), lty = 1)
+
+# Transitional_2 MNN lineage 4 (darkblue)
+lines(sds_T2_sub, lwd = 5, col = adjustcolor("darkblue", alpha.f = 0.6), lty = 2)
+
+unique_clusters <- sort(unique(as.character(clustering)))
+for (i in unique_clusters) {
+  cells <- which(as.character(clustering) == i)
+  if (length(cells) > 0) {
+    text(mean(dimred[cells, 1]), mean(dimred[cells, 2]), labels = i, font = 2, cex = 1)
+  }
+}
+legend("topleft",
+       legend = c("Start = Bud Tip (lineages 1,3,4)", "Start = Transitional_2 (lineage 4)"),
+       col = c("maroon", "darkblue"), lwd = 5, lty = c(1, 2), bty = "n")
+dev.off()
+```
+
+```{r plot-slingshot-lineages-slingshot-dist}
+pdf("Slingshot_lineages_post2.pdf", width = 12, height = 10, useDingbats = FALSE)
+plot(dimred[, 1:2], col = my_colors_UMAP[as.character(clustering)],
+     cex = 0.5, pch = 16, xlab = "", ylab = "", xaxt = "n", yaxt = "n", axes = FALSE)
+lines(sds_BT2_sub, lwd = 5, col = adjustcolor("maroon",   alpha.f = 0.8), lty = 1)
+lines(sds_T1_sub,  lwd = 5, col = adjustcolor("darkblue", alpha.f = 0.6), lty = 2)
+for (i in sort(unique(as.character(clustering)))) {
+  cells <- which(as.character(clustering) == i)
+  if (length(cells) > 0) text(mean(dimred[cells, 1]), mean(dimred[cells, 2]), labels = i, font = 2, cex = 1)
+}
+legend("topleft",
+       legend = c("Start = Bud Tip (lineages 2,3)", "Start = Transitional_1 (lineage 3)"),
+       col = c("maroon", "darkblue"), lwd = 5, lty = c(1, 2), bty = "n")
+dev.off()
+```
+
+## Pseudotime Extraction and Visualization
+
+```{r slingshot-pseudotime-plot, fig.height=8, fig.width=12}
+# Compute weighted-average pseudotime across all curves from sds_BT
+pt_all   <- slingPseudotime(sds_BT)
+cw       <- slingCurveWeights(sds_BT)
+pt_scaled <- apply(pt_all, 2, scale01)
+w_sum     <- rowSums(cw, na.rm = TRUE)
+pt_combined <- rowSums(pt_scaled * cw, na.rm = TRUE) / w_sum
+pt_combined[!is.finite(pt_combined)] <- 0
+
+n_colors <- 200
+pal <- my_colors_fn(n_colors)
+idx <- 1 + floor(pt_combined * (n_colors - 1))
+pt_cols <- pal[idx]
+
+pdf("Slingshot_pseudotime.pdf", width = 12, height = 9, useDingbats = FALSE)
+plot(dimred[, 1:2], col = pt_cols, pch = 16, cex = 0.5,
+     xlab = "", ylab = "", xaxt = "n", yaxt = "n", axes = FALSE)
+for (i in unique_clusters) {
+  cells <- which(clustering == i)
+  if (length(cells) > 0) {
+    text(mean(dimred[cells, 1]), mean(dimred[cells, 2]),
+         labels = i, font = 2, cex = 1.2, col = "darkred")
+  }
+}
+dev.off()
+```
+
+```{r slingshot-combined-pseudotime-two-starts, fig.height=8, fig.width=12}
+# Build SCE keeping only cells from BT and T2 lineages (combined sds)
+w_BT    <- slingCurveWeights(sds_BT_sub)
+w_T2    <- slingCurveWeights(sds_T2_sub)
+cells_BT   <- rownames(w_BT)[rowSums(w_BT) > 0]
+cells_T2   <- rownames(w_T2)[rowSums(w_T2) > 0]
+cells_keep <- intersect(union(cells_BT, cells_T2), colnames(counts))
+
+counts_keep <- as.matrix(counts)[, cells_keep, drop = FALSE]
+
+sce_keep <- SingleCellExperiment(assays = list(counts = counts_keep))
+colData(sce_keep)$cluster <- clustering[match(cells_keep, rownames(dimred))]
+reducedDim(sce_keep, "dimred") <- dimred[cells_keep, , drop = FALSE]
+
+# Store both sds objects in SCE metadata for traceability
+metadata(sce_keep)$sds_BT134 <- sds_BT_sub[cells_keep, ]
+metadata(sce_keep)$sds_T2_4  <- sds_T2_sub[cells_keep, ]
+
+# Combined pseudotime merging both lineage sets
+pt_BT   <- combined_pt_from_sds(metadata(sce_keep)$sds_BT134, cells_keep)
+pt_T2   <- combined_pt_from_sds(metadata(sce_keep)$sds_T2_4,  cells_keep)
+pt_both <- pmin(pt_BT, pt_T2, na.rm = TRUE)
+pt_both[is.infinite(pt_both)] <- NA_real_
+
+pt_cols2 <- rep("lightgrey", length(pt_both))
+ok  <- which(!is.na(pt_both))
+idx2 <- pmax(1, pmin(n_colors, 1 + floor(pt_both[ok] * (n_colors - 1))))
+pt_cols2[ok] <- pal[idx2]
+
+dimred_keep    <- reducedDim(sce_keep, "dimred")[, 1:2, drop = FALSE]
+clustering_ke  <- colData(sce_keep)$cluster
+unique_clusters_ke <- sort(unique(as.character(clustering_ke)))
+
+pdf("Slingshot_pseudotime_sce_keep_BOTH.pdf", width = 12, height = 9, useDingbats = FALSE)
+plot(dimred_keep[, 1], dimred_keep[, 2], col = pt_cols2,
+     pch = 16, cex = 0.5, xlab = "", ylab = "", xaxt = "n", yaxt = "n", axes = FALSE)
+for (i in unique_clusters_ke) {
+  ii <- which(as.character(clustering_ke) == i)
+  if (length(ii) > 0)
+    text(mean(dimred_keep[ii, 1]), mean(dimred_keep[ii, 2]),
+         labels = i, font = 2, cex = 1.2, col = "darkred")
+}
+lines(metadata(sce_keep)$sds_BT134, lwd = 2,
+      col = adjustcolor("mediumblue", alpha.f = 0.5), lty = 1)
+lines(metadata(sce_keep)$sds_T2_4,  lwd = 2,
+      col = adjustcolor("red",        alpha.f = 0.5), lty = 2)
+legend("topleft",
+       legend = c("Bud Tip (1,3,4)", "Transitional_2 (4)"),
+       col = c(adjustcolor("mediumblue", 0.7), adjustcolor("red", 0.7)),
+       lwd = 2, lty = c(1, 2), bty = "n")
+dev.off()
+```
+
+## Pseudotime Ridge Plots
+
+```{r pseudotime-ridge-all-lineages, fig.height=20, fig.width=16}
+# All cell types × all lineages ridge plot
+pt_long_all <- as.data.frame(pt_all) %>%
+  mutate(cell_type3 = clustering) %>%
+  pivot_longer(cols = colnames(pt_all), names_to = "lineage", values_to = "pt") %>%
+  filter(!is.na(pt))
+
+meds_all <- pt_long_all %>%
+  group_by(lineage, cell_type3) %>%
+  summarize(med = median(pt), .groups = "drop")
+
+pt_long_all <- pt_long_all %>%
+  left_join(meds_all, by = c("lineage", "cell_type3")) %>%
+  mutate(cell_type_ord = reorder_within(cell_type3, med, within = lineage))
+
+ggplot(pt_long_all, aes(x = pt, y = cell_type_ord, fill = ..x..)) +
+  geom_density_ridges_gradient(scale = 2.2, rel_min_height = 0.01, size = 0.2, color = "white") +
+  scale_fill_gradientn(colors = my_colors_fn(200), name = "Pseudotime") +
+  tidytext::scale_y_reordered() +
+  facet_wrap(~ lineage, ncol = 1, scales = "free_y") +
+  labs(x = "Pseudotime", y = NULL, title = "Pseudotime distributions by cell type and lineage") +
+  theme_ridges() + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r pseudotime-ridge-filtered, fig.height=12, fig.width=8}
+# Ridge plot filtered to biologically relevant cell types per lineage
+keep_list <- list(
+  Lineage1 = c("Bud Tip", "AT2_1", "AT2_2", "Transitional_1", "AT1_1", "AT1_2"),
+  Lineage2 = c("Bud Tip", "AT2_1", "AT2_2", "Transitional_2"),
+  Lineage3 = c("Bud Tip", "AT2_1", "AT2_2", "AT2_4"),
+  Lineage4 = c("Bud Tip", "AT2_3")
+)
+
+pt_long_filt <- as.data.frame(pt_all) %>%
+  mutate(cell_type = clustering) %>%
+  pivot_longer(cols = colnames(pt_all), names_to = "lineage", values_to = "pt") %>%
+  filter(!is.na(pt)) %>%
+  filter(mapply(function(ln, ct) ct %in% keep_list[[ln]], lineage, cell_type))
+
+meds_filt <- pt_long_filt %>%
+  group_by(lineage, cell_type) %>%
+  summarize(med = median(pt), .groups = "drop")
+
+pt_long_filt <- pt_long_filt %>%
+  left_join(meds_filt, by = c("lineage", "cell_type")) %>%
+  mutate(cell_type_ord = reorder_within(cell_type, med, within = lineage))
+
+ggplot(pt_long_filt, aes(x = pt, y = cell_type_ord, fill = ..x..)) +
+  geom_density_ridges_gradient(scale = 2.2, rel_min_height = 0.01, size = 0.2, color = "white") +
+  scale_fill_gradientn(colors = my_colors_fn(200), name = "Pseudotime") +
+  tidytext::scale_y_reordered() +
+  facet_wrap(~ lineage, ncol = 1, scales = "free_y") +
+  labs(x = "Pseudotime", y = NULL, title = "Pseudotime by specified cell types per lineage") +
+  theme_ridges() + theme(plot.title = element_text(hjust = 0.5), panel.grid = element_blank())
+```
+
+```{r pseudotime-ridge-combined, fig.height=12, fig.width=16}
+# Ridge plot using weighted-average combined pseudotime
+df_pt <- data.frame(cell_type = clustering, pt = pt_combined) %>% na.omit()
+ct_levels <- df_pt %>%
+  group_by(cell_type) %>% summarize(med = median(pt), .groups = "drop") %>%
+  arrange(med) %>% pull(cell_type)
+df_pt$cell_type <- factor(df_pt$cell_type, levels = ct_levels)
+
+ggplot(df_pt, aes(x = pt, y = cell_type, fill = ..x..)) +
+  geom_density_ridges_gradient(scale = 2.4, rel_min_height = 0.01, size = 0.2, color = "white",
+                                quantile_lines = TRUE, quantiles = 2) +
+  scale_fill_gradientn(colors = my_colors_fn(200), name = "Pseudotime") +
+  labs(x = "Pseudotime", y = NULL, title = "Pseudotime distribution by cell type") +
+  theme_ridges() + theme(plot.title = element_text(hjust = 0.5))
+```
+
+## tradeSeq: GAM Fitting
+
+```{r tradseq-filter-counts}
+# Subset counts to variable genes for GAM fitting
+variable_genes <- VariableFeatures(TF_fetal_pediatric_epi_post_alve)
+counts_post     <- GetAssayData(TF_fetal_pediatric_epi_post_alve, assay = "RNA", layer = "counts")
+filt_counts     <- counts_post[variable_genes, ]
+dim(filt_counts)
+```
+
+```{r tradeseq-fitgam, fig.height=8, fig.width=14}
+# NOTE: sds_BT / curves object must be defined from above (using sds_BT from pre_alve run).
+# GAM fitting is computationally intensive; save the output immediately after.
+library(BiocParallel)
+bp <- MulticoreParam(workers = 10)
+register(bp)
+
+# FLAGGED: Original code used 'curves' which was derived from sds_BT getCurves above.
+# Ensure 'curves' refers to the getCurves result on the pre_alve object.
+sce_post <- fitGAM(counts = as.matrix(filt_counts), sds = sds_BT, nknots = 8, BPPARAM = bp)
+plotGeneCount(sds_BT, filt_counts, clusters = clustering, models = sce_post)
+```
+
+```{r save-sce-post}
+saveRDS(sce_post, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_post_alve_sce.rds")
+```
+
+```{r load-sce-post, eval=FALSE}
+# Reload saved SCE if continuing from a saved checkpoint
+sce_post <- readRDS("TF_fetal_pediatric_epi_post_alve_sce.rds")
+```
+
+```{r tradeseq-pseudotime-store}
+# Store pseudotime per lineage in colData for downstream use
+pt_gam <- slingPseudotime(sds_BT)
+common  <- intersect(colnames(sce_post), rownames(pt_gam))
+pt_sub  <- pt_gam[common, , drop = FALSE]
+for (j in seq_len(ncol(pt_sub))) {
+  colData(sce_post)[common, paste0("slingshot_pseudotime_", j)] <- pt_sub[, j]
+}
+```
+
+## tradeSeq: Association, Pattern, and Differential End Tests
+
+```{r tradeseq-association}
+# Genes whose expression is associated with pseudotime along any lineage
+assoRes <- associationTest(sce_post)
+head(assoRes)
+```
+
+```{r tradeseq-startvsend}
+# Genes differentially expressed between start and end of each lineage
+# NOTE: sce_post used here — original code referenced 'sce2' which appears to be sce_post.
+startRes <- startVsEndTest(sce_post, lineages = TRUE)
+startRes  <- startRes %>% rownames_to_column(var = "gene") %>%
+  filter(!grepl("^MT-", gene))
+```
+
+```{r tradeseq-startvsend-top}
+# Top 100 genes per lineage by Wald statistic
+top_by_lineage <- lapply(1:4, function(k) {
+  colk <- paste0("waldStat_lineage", k)
+  startRes %>% arrange(desc(.data[[colk]])) %>% slice_head(n = 100) %>%
+    select(gene = gene, waldStat = .data[[colk]])
+})
+names(top_by_lineage) <- paste0("Lineage", 1:4)
+
+# Side-by-side top 100 table
+top100_combined <- bind_cols(lapply(1:4, function(k) {
+  startRes %>% arrange(desc(.data[[paste0("waldStat_lineage", k)]])) %>%
+    slice_head(n = 100) %>%
+    select(!!paste0("L", k, "_gene") := gene,
+           !!paste0("L", k, "_wald") := .data[[paste0("waldStat_lineage", k)]])
+}))
+print(top100_combined)
+```
+
+```{r tradeseq-smoother-cftr, fig.height=6, fig.width=10}
+# Example: visualize smoother for CFTR (a LAP/airway marker)
+plotSmoothers(sce_post, filt_counts, gene = "CFTR")
+plotGeneCount(sds_BT, filt_counts, gene = "CFTR")
+```
+
+```{r tradeseq-customres}
+# Custom pseudotime window test
+customRes <- startVsEndTest(sce_post, pseudotimeValues = c(0, 5), lineages = TRUE)
+customRes  <- customRes %>% rownames_to_column(var = "gene") %>%
+  filter(!grepl("^MT-", gene))
+
+oCustom       <- order(customRes$waldStat, decreasing = TRUE)
+sigGeneCustom <- names(sce_post)[oCustom[1]]
+plotSmoothers(sce_post, filt_counts, gene = sigGeneCustom)
+plotGeneCount(sds_BT,  filt_counts, gene = "NEAT1")
+```
+
+```{r tradeseq-pattern}
+# Pattern test: pairwise lineage comparison
+patternRes <- patternTest(sce_post, pairwise = TRUE)
+patternRes  <- patternRes %>% rownames_to_column(var = "gene") %>%
+  filter(!grepl("^MT-", gene))
+
+oPat   <- order(patternRes$waldStat_3vs4, decreasing = TRUE)
+top20p <- patternRes$gene[oPat][1:20]
+cat(patternRes$gene[oPat][1:100], sep = "\n")
+```
+
+```{r tradeseq-pattern-plot, fig.height=6, fig.width=10}
+plotSmoothers(sce_post, filt_counts, gene = rownames(patternRes)[oPat][3])
+plotGeneCount(sds_BT,   filt_counts, gene = rownames(patternRes)[oPat][3])
+```
+
+```{r tradeseq-earlyde}
+# Early differential expression between lineages
+earlyDERes <- earlyDETest(sce_post, knots = c(1, 2))
+oEarly     <- order(earlyDERes$waldStat, decreasing = TRUE)
+head(rownames(earlyDERes)[oEarly])
+cat(rownames(earlyDERes)[1:100], sep = "\n")
+plotSmoothers(sce_post, filt_counts, gene = rownames(earlyDERes)[oEarly][1])
+plotGeneCount(sds_BT,   filt_counts, gene = rownames(earlyDERes)[oEarly][1])
+```
+
+```{r tradeseq-transient}
+# Transient genes: high pattern score, low end score
+endRes   <- diffEndTest(sce_post)
+compare  <- merge(
+  patternRes %>% select(Gene = gene, pattern = waldStat),
+  data.frame(Gene = rownames(endRes), end = endRes$waldStat),
+  by = "Gene", all = FALSE
+)
+compare$transientScore <-
+  rank(-compare$end, ties.method = "min")^2 + rank(compare$pattern, ties.method = "random")^2
+
+ggplot(compare, aes(x = log(pattern), y = log(end))) +
+  geom_point(aes(col = transientScore)) +
+  labs(x = "patternTest Wald Statistic (log)",
+       y = "diffEndTest Wald Statistic (log)") +
+  scale_color_continuous(low = "yellow", high = "red") +
+  theme_classic()
+
+topTransient <- compare[which.max(compare$transientScore), "Gene"]
+plotSmoothers(sce_post, filt_counts, gene = topTransient)
+plotGeneCount(sds_BT,   filt_counts, gene = topTransient)
+```
+
+## tradeSeq Heatmaps: Top DE Genes per Lineage
+
+```{r tradeseq-heatmap, fig.height=8, fig.width=20}
+topN <- 20
+top_by_lin <- lapply(1:4, function(k) {
+  colk <- paste0("waldStat_lineage", k)
+  startRes %>% arrange(desc(.data[[colk]])) %>% slice_head(n = topN) %>% pull(gene)
+})
+names(top_by_lin) <- paste0("Lineage", 1:4)
+
+avg_exp <- AverageExpression(TF_Alve_subset, group.by = "cell_type3",
+                              assays = "RNA", slot = "data")$RNA
+avg_norm <- setNames(colnames(avg_exp), normalize_labels(colnames(avg_exp)))
+
+scale_rows <- function(x) {
+  m <- rowMeans(x, na.rm = TRUE)
+  s <- apply(x, 1, sd, na.rm = TRUE); s[s == 0 | is.na(s)] <- 1
+  sweep(sweep(x, 1, m, "-"), 1, s, "/")
+}
+col_fun <- colorRamp2(c(-2, 0, 2), c("darkgreen", "white", "red"))
+
+# Lineage-specific cell type ordering
+keep_list_ht <- list(
+  Lineage1 = c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_1","AT1_2"),
+  Lineage2 = c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_3"),
+  Lineage3 = c("Bud Tip","AT2_2","AT2_1","AT2_3"),
+  Lineage4 = c("Bud Tip","AT2_2","AT2_1","AT2_4")
+)
+
+ht_list <- lapply(1:4, function(k) {
+  genes_k       <- intersect(top_by_lin[[k]], rownames(avg_exp))
+  wanted_disp   <- keep_list_ht[[paste0("Lineage", k)]]
+  wanted_norm   <- normalize_labels(wanted_disp)
+  mapped        <- unname(avg_norm[wanted_norm])
+  missing_mask  <- is.na(mapped)
+  if (any(missing_mask)) {
+    miss_names <- wanted_disp[missing_mask]
+    filler     <- matrix(NA_real_, nrow = nrow(avg_exp), ncol = sum(missing_mask),
+                         dimnames = list(rownames(avg_exp), miss_names))
+    avg_ext    <- cbind(avg_exp, filler)
+    mapped[missing_mask] <- miss_names
+  } else { avg_ext <- avg_exp }
+
+  mat_k  <- as.matrix(avg_ext[genes_k, mapped, drop = FALSE])
+  colnames(mat_k) <- wanted_disp
+  mat_kz <- scale_rows(mat_k)
+
+  Heatmap(mat_kz, name = paste0("Z (L", k, ")"), col = col_fun,
+          na_col = "grey95", cluster_rows = FALSE, cluster_columns = FALSE,
+          show_row_names = TRUE, show_column_names = TRUE,
+          column_title = paste("Cell types: Lineage", k),
+          row_title = paste0("Lineage ", k),
+          row_title_gp = gpar(fontface = "bold"),
+          heatmap_legend_param = list(at = c(-2, 0, 2), labels = c("Low","Mid","High")))
+})
+
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(1, 4)))
+for (i in 1:4) {
+  pushViewport(viewport(layout.pos.row = 1, layout.pos.col = i))
+  draw(ht_list[[i]], newpage = FALSE)
+  upViewport()
+}
+```
+
+------------------------------------------------------------------------
+
+# CellChat Analysis
+
+> CellChat is run on **`TF_Alve_subset`** using the `cell_type3`
+> annotation. The object was created and saved in a prior session; load
+> path is shown first. The full build-from-scratch workflow follows as
+> an alternative.
+
+## Load Pre-computed CellChat Object (Checkpoint)
+
+```{r load-cellchat-checkpoint, eval=FALSE}
+# Load previously saved CellChat object to skip computation
+cellchat <- readRDS(
+  "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/20260106/cellchat_TF_Alve_subset.rds"
+)
+```
+
+## Build CellChat from Scratch
+
+```{r create-cellchat-object}
+# Normalized SCT expression matrix
+data.input <- GetAssayData(TF_Alve_subset, assay = "SCT", layer = "data")
+
+# Cell metadata with labels (cell_type3) and batch as sample
+labels <- TF_Alve_subset$cell_type3
+batch  <- as.factor(TF_Alve_subset@meta.data$batch)
+meta   <- data.frame(labels = labels, samples = batch, row.names = names(labels))
+
+# Create CellChat object
+cellchat <- createCellChat(object = data.input, meta = meta)
+```
+
+```{r cellchat-select-database}
+# Load the human L-R database
+CellChatDB <- CellChatDB.human
+showDatabaseCategory(CellChatDB)
+glimpse(CellChatDB$interaction)
+
+# Three database selection options — (C) uses all interactions (active)
+# (A) CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling")
+# (B) CellChatDB.use <- subsetDB(CellChatDB)
+# (C) Use the full database:
+CellChatDB.use <- CellChatDB
+cellchat@DB   <- CellChatDB.use
+```
+
+```{r cellchat-preprocess}
+# Subset expression to genes in selected L-R pairs
+cellchat <- subsetData(cellchat)
+
+# Identify overexpressed ligands/receptors per cell group
+future::plan("multisession", workers = 4)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+# Smooth dropout effects using protein-protein interaction network
+cellchat <- smoothData(cellchat, adj = PPI.human)
+```
+
+```{r cellchat-compute-prob}
+# Infer communication probabilities at L-R pair level
+plan("sequential")
+options(future.globals.maxSize = 8 * 1024^3)
+cellchat <- computeCommunProb(cellchat, type = "triMean", trim = NULL, raw.use = FALSE)
+```
+
+```{r cellchat-reorder-groups}
+# Reorder cluster display order for consistent visualization
+old.cluster.name <- c("Bud Tip","Transitional",
+                       "AT2_1","AT2_2","AT2_3","AT2_4",
+                       "AT1_1","AT1_2","AT1_3","AT1_4","AT1_5")
+new.cluster.name <- old.cluster.name  # same labels, reorder only
+new.order        <- old.cluster.name
+
+cellchat <- updateClusterLabels(
+  object           = cellchat,
+  old.cluster.name = old.cluster.name,
+  new.cluster.name = new.cluster.name,
+  new.order        = new.order,
+  new.cluster.metaname = "celltype3_ordered"
+)
+```
+
+```{r cellchat-filter-aggregate}
+# Filter communications requiring ≥10 cells per group
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+# Aggregate to pathway level
+cellchat <- computeCommunProbPathway(cellchat)
+
+# Aggregate across all cell groups
+cellchat <- aggregateNet(cellchat)
+```
+
+```{r save-cellchat}
+saveRDS(cellchat, file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/cellchat_TF_Alve_subset.rds")
+```
+
+## CellChat Network Visualization
+
+```{r cellchat-pathway-list}
+pathways.show.all <- cellchat@netP$pathways
+cellchat@netP$pathways
+```
+
+```{r plot-cellchat-circle, fig.height=8, fig.width=8}
+# Circle plot for BMP pathway
+pathways.show <- c("BMP")
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle",
+                    color.use = NULL, sources.use = NULL, targets.use = NULL)
+title(paste(pathways.show, "Signaling Pathway - Circle Plot"), line = 1, cex.main = 1.2)
+```
+
+```{r plot-cellchat-hierarchy, fig.height=8, fig.width=12}
+# Hierarchy plot (adjust vertex.receiver to desired target cluster indices)
+vertex.receiver <- seq(1, 2)
+netVisual_aggregate(cellchat, signaling = pathways.show,
+                    layout = "hierarchy", vertex.receiver = vertex.receiver)
+```
+
+```{r plot-cellchat-chord}
+# Chord diagram (PDF export)
+pdf("cellchat.pdf", width = 20, height = 16)
+netVisual_chord_cell(cellchat, signaling = pathways.show, small.gap = 1, big.gap = 10)
+dev.off()
+```
+
+```{r plot-cellchat-heatmap, fig.height=6, fig.width=8}
+netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+```
+
+```{r plot-cellchat-lr-contribution, fig.height=8, fig.width=8}
+# Contribution of each L-R pair to the BMP pathway
+netAnalysis_contribution(cellchat, signaling = "BMP")
+
+pairLR   <- extractEnrichedLR(cellchat, signaling = "BMP", geneLR.return = FALSE)
+LR.show  <- pairLR[7, ]
+netVisual_individual(cellchat, signaling = "BMP",
+                     pairLR.use = LR.show, layout = "circle")
+```
+
+```{r plot-cellchat-bubble, fig.height=6, fig.width=10}
+# Bubble plot: TGFb signaling from Bud Tip / Transitional to AT2 subtypes
+netVisual_bubble(cellchat,
+                 sources.use = c("Bud Tip", "Transitional"),
+                 targets.use = c("AT2_1","AT2_2","AT2_3","AT2_4"),
+                 signaling   = c("TGFb"),
+                 remove.isolate = FALSE)
+```
+
+```{r plot-cellchat-fgf-bubble}
+# FGF signaling bubble plot
+pairLR.fgf <- extractEnrichedLR(cellchat, signaling = "FGF")
+netVisual_bubble(cellchat, sources.use = "Bud Tip", targets.use = c(5:8),
+                 pairLR.use = pairLR.fgf, remove.isolate = TRUE)
+
+netVisual_bubble(cellchat, sources.use = c(3:4), targets.use = c(5:8),
+                 pairLR.use = pairLR.fgf, remove.isolate = TRUE,
+                 sort.by.target = TRUE, sort.by.source = TRUE,
+                 sort.by.source.priority = FALSE)
+```
+
+```{r plot-cellchat-chord-bmp}
+pdf("BMP_LR_circle.pdf", width = 10, height = 10)
+netVisual_chord_gene(cellchat,
+                     sources.use = c("Bud Tip","Transitional"),
+                     targets.use = c("AT2_1","AT2_2","AT2_3","AT2_4"),
+                     signaling = "BMP", small.gap = 2, big.gap = 10,
+                     lab.cex = 1, legend.pos.x = 20, legend.pos.y = 15)
+dev.off()
+
+pdf("netP_LR_circle.pdf", width = 10, height = 10)
+netVisual_chord_gene(cellchat,
+                     sources.use = c("Bud Tip","AT2_1","AT2_2","AT2_3","AT2_4"),
+                     targets.use = c("Bud Tip","AT2_1","AT2_2","AT2_3","AT2_4"),
+                     slot.name = "netP",
+                     signaling = cellchat@netP[["pathways"]][seq(1, 10)],
+                     small.gap = 1, big.gap = 10,
+                     lab.cex = 0.6, legend.pos.x = 16, legend.pos.y = 36)
+dev.off()
+```
+
+```{r plot-cellchat-gene-expression, fig.height=10, fig.width=10}
+# Gene expression violin for TGFb pathway
+plotGeneExpression(cellchat, signaling = "TGFb", enriched.only = TRUE, type = "violin")
+
+# Cross-check in Seurat VlnPlot
+genes_tgfb <- extractEnrichedLR(cellchat, signaling = "TGFb", geneLR.return = TRUE)$geneLR
+VlnPlot(TF_Alve_subset, features = genes_tgfb)
+```
+
+## Systematic Signaling Role Analysis
+
+```{r cellchat-centrality}
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+```
+
+```{r plot-cellchat-role-network, fig.height=4, fig.width=8}
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show,
+                                  width = 8, height = 2.5, font.size = 10)
+```
+
+```{r plot-cellchat-scatter, fig.height=6, fig.width=8}
+netAnalysis_signalingRole_scatter(cellchat)
+netAnalysis_signalingRole_scatter(cellchat, signaling = "BMP")
+```
+
+```{r plot-cellchat-role-heatmap}
+ht1 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing"); ht1
+ht2 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming"); ht2
+ht1 + ht2
+```
+
+## Communication Pattern Analysis
+
+```{r cellchat-patterns-outgoing}
+library(NMF); library(ggalluvial)
+selectK(cellchat, pattern = "outgoing")
+
+nPatterns <- 6
+cellchat  <- identifyCommunicationPatterns(cellchat, pattern = "outgoing", k = nPatterns)
+```
+
+```{r plot-cellchat-river-outgoing, fig.height=8, fig.width=10}
+netAnalysis_river(cellchat, slot.name = "netP", pattern = "outgoing", cutoff = 0.5)
+netAnalysis_dot(cellchat, slot.name = "netP", pattern = "outgoing",
+                cutoff = NULL, dot.size = c(1, 3))
+```
+
+```{r cellchat-patterns-incoming}
+selectK(cellchat, pattern = "incoming")
+
+nPatterns <- 2
+cellchat  <- identifyCommunicationPatterns(cellchat, pattern = "incoming", k = nPatterns)
+```
+
+```{r plot-cellchat-river-incoming, fig.height=8, fig.width=10}
+netAnalysis_river(cellchat, pattern = "incoming")
+netAnalysis_dot(cellchat, pattern = "incoming")
+```
+
+## Manifold Learning of Signaling Networks
+
+```{r cellchat-similarity-functional}
+cellchat <- computeNetSimilarity(cellchat, type = "functional")
+cellchat <- netEmbedding(cellchat,   type = "functional")
+cellchat <- netClustering(cellchat,  type = "functional")
+```
+
+```{r plot-cellchat-embedding-functional, fig.height=8, fig.width=12}
+netVisual_embedding(cellchat, type = "functional", label.size = 3.5)
+netVisual_embeddingZoomIn(cellchat, type = "functional", nCol = 2)
+```
+
+```{r cellchat-similarity-structural, fig.height=6, fig.width=10}
+cellchat <- computeNetSimilarity(cellchat, type = "structural")
+cellchat <- netEmbedding(cellchat,  type = "structural")
+cellchat <- netClustering(cellchat, type = "structural")
+netVisual_embedding(cellchat, type = "structural", label.size = 3.5)
+```
+
+```{r cellchat-add-umap}
+# Add Seurat UMAP embedding to CellChat object (required for Shiny app)
+dimred_cc <- TF_Alve_subset@reductions$umap@cell.embeddings
+cellchat  <- addReduction(cellchat, dr = dimred_cc, dr.name = "umap", force.add = TRUE)
+cellchat@meta$samples <- factor("all")
+```
+
+```{r cellchat-shiny, eval=FALSE}
+# Launch interactive CellChat Shiny app (run interactively only)
+runCellChatApp(cellchat)
+```
+
+------------------------------------------------------------------------
+
+# Cell Composition Analysis
+
+> Quantify how alveolar cell types are distributed across fetal and
+> pediatric samples and how their proportions change with age. Analyses
+> are linked to specific Slingshot lineages.
+
+```{r composition-setup}
+meta_df  <- TF_Alve_subset@meta.data
+
+# Total cells per batch (used for % calculations)
+total_df <- meta_df %>%
+  group_by(batch) %>%
+  summarise(total_cells = n(), .groups = "drop")
+```
+
+## Age Distributions by Cell Type
+
+```{r composition-age-at2, fig.height=10, fig.width=10}
+celltypes_to_plot <- c("Bud Tip","AT2_2","AT2_1","AT2_3")
+
+plot_df_age <- meta_df[
+  meta_df$cell_type3 %in% celltypes_to_plot &
+  meta_df$group %in% c("fetal", "pediatric"), ]
+plot_df_age$cell_type3 <- factor(plot_df_age$cell_type3, levels = celltypes_to_plot)
+plot_df_age$group      <- factor(plot_df_age$group, levels = c("fetal", "pediatric"))
+
+ggplot(plot_df_age, aes(x = age_days, fill = group)) +
+  geom_histogram(bins = 25, color = "black") +
+  facet_grid(cell_type3 ~ group, scales = "free_x") +
+  scale_fill_manual(values = c("fetal" = "#6A3D9A", "pediatric" = "#F28E2B")) +
+  theme_classic(base_size = 14) +
+  labs(title = "Age distributions across Bud Tip and AT2 subtypes",
+       x = "Age (days)", y = "Number of cells") +
+  guides(fill = "none")
+```
+
+```{r composition-age-at1, fig.height=12, fig.width=10}
+celltypes_at1 <- c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_3")
+
+plot_df_at1 <- meta_df[
+  meta_df$cell_type3 %in% celltypes_at1 &
+  meta_df$group %in% c("fetal","pediatric"), ]
+plot_df_at1$cell_type3 <- factor(plot_df_at1$cell_type3, levels = celltypes_at1)
+plot_df_at1$group      <- factor(plot_df_at1$group, levels = c("fetal","pediatric"))
+
+ggplot(plot_df_at1, aes(x = age_days, fill = group)) +
+  geom_histogram(bins = 25, color = "black") +
+  facet_grid(cell_type3 ~ group, scales = "free_x") +
+  scale_fill_manual(values = c("fetal" = "#6A3D9A", "pediatric" = "#F28E2B")) +
+  theme_classic(base_size = 14) +
+  labs(title = "Age distributions across Bud Tip and AT1 subtypes",
+       x = "Age (days)", y = "Number of cells") +
+  guides(fill = "none")
+```
+
+## Cell Type Abundance as % of Total Cells Per Sample
+
+```{r composition-pct-at2}
+make_pct_plot <- function(celltype_use, groups_use = c("fetal","pediatric")) {
+  plot_df <- meta_df %>%
+    filter(group %in% groups_use, cell_type3 == celltype_use) %>%
+    group_by(batch, group, age_days) %>%
+    summarise(celltype_cells = n(), .groups = "drop") %>%
+    left_join(total_df, by = "batch") %>%
+    mutate(pct = 100 * celltype_cells / total_cells) %>%
+    filter(!is.na(age_days), !is.na(pct)) %>%
+    arrange(group, age_days) %>%
+    mutate(sample_age = paste0(batch, " (", age_days, ")")) %>%
+    group_by(group) %>%
+    mutate(sample_age = factor(sample_age, levels = unique(sample_age))) %>%
+    ungroup()
+
+  ggplot(plot_df, aes(x = sample_age, y = pct, fill = group)) +
+    geom_col(color = "black", width = 0.85) +
+    facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+    scale_fill_manual(values = c("fetal" = "#6A3D9A", "pediatric" = "#F28E2B")) +
+    theme_classic(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    labs(title = paste0(celltype_use, " as % of total cells per sample"),
+         x = "Sample (age_days)", y = paste0(celltype_use, " cells (%)")) +
+    guides(fill = "none")
+}
+
+make_pct_plot("AT2_2")
+make_pct_plot("Bud Tip")
+```
+
+```{r composition-pct-all, fig.height=16, fig.width=8}
+# All cell types as % total, faceted
+plot_df_all <- meta_df %>%
+  filter(group %in% c("fetal","pediatric")) %>%
+  group_by(batch, group, age_days, cell_type3) %>%
+  summarise(celltype_cells = n(), .groups = "drop") %>%
+  left_join(total_df, by = "batch") %>%
+  mutate(pct = 100 * celltype_cells / total_cells) %>%
+  filter(!is.na(age_days), !is.na(pct)) %>%
+  arrange(cell_type3, group, age_days) %>%
+  mutate(sample_age = paste0(batch, " (", age_days, ")")) %>%
+  group_by(cell_type3, group) %>%
+  mutate(sample_age = factor(sample_age, levels = unique(sample_age))) %>%
+  ungroup()
+
+ggplot(plot_df_all, aes(x = sample_age, y = pct, fill = group)) +
+  geom_col(color = "black", width = 0.85) +
+  facet_wrap(~ cell_type3, ncol = 2, scales = "free_x") +
+  scale_fill_manual(values = c("fetal" = "#6A3D9A", "pediatric" = "#F28E2B")) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(title = "Cell types as % of total cells per sample",
+       x = "Sample (age_days)", y = "Cells (%)") +
+  guides(fill = "none")
+```
+
+## Lineage-Filtered Cell Counts Per Sample
+
+```{r composition-lineage-weights}
+# Extract per-lineage cell assignments from Slingshot curve weights
+w_sling  <- SummarizedExperiment::assay(sds_BT, "weights")
+lin1_cells <- rownames(w_sling)[w_sling[, "Lineage1"] > 0]
+lin2_cells <- rownames(w_sling)[w_sling[, "Lineage2"] > 0]
+lin3_cells <- rownames(w_sling)[w_sling[, "Lineage3"] > 0]
+lin4_cells <- rownames(w_sling)[w_sling[, "Lineage4"] > 0]
+```
+
+```{r composition-lineage-plots, fig.height=8, fig.width=10}
+make_lineage_plot <- function(cells_lin, celltypes_to_plot, title_str) {
+  plot_df <- meta_df %>%
+    mutate(cell = rownames(meta_df)) %>%
+    filter(cell %in% cells_lin,
+           cell_type3 %in% celltypes_to_plot,
+           group %in% c("fetal","pediatric")) %>%
+    group_by(cell_type3, group, batch, age_days) %>%
+    summarise(n_cells = n(), .groups = "drop") %>%
+    arrange(cell_type3, group, age_days) %>%
+    group_by(cell_type3, group) %>%
+    mutate(sample_age = factor(paste0(batch," (",age_days,")"), levels = unique(paste0(batch," (",age_days,")")))) %>%
+    ungroup()
+  plot_df$cell_type3 <- factor(plot_df$cell_type3, levels = celltypes_to_plot)
+  plot_df$group      <- factor(plot_df$group, levels = c("fetal","pediatric"))
+
+  ggplot(plot_df, aes(x = sample_age, y = n_cells, fill = group)) +
+    geom_col(color = "black", width = 0.85) +
+    facet_grid(cell_type3 ~ group, scales = "free_x", space = "free_x") +
+    scale_fill_manual(values = c("fetal" = "#6A3D9A", "pediatric" = "#F28E2B")) +
+    theme_classic(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    labs(title = title_str, x = "Sample (age_days)", y = "Number of cells") +
+    guides(fill = "none")
+}
+
+make_lineage_plot(lin1_cells,
+  c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_1","AT1_2"),
+  "Cell counts per sample (Lineage1 by weights)")
+
+make_lineage_plot(lin2_cells,
+  c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_3"),
+  "Cell counts per sample (Lineage2 by weights)")
+
+make_lineage_plot(lin3_cells,
+  c("Bud Tip","AT2_2","AT2_1","AT2_3"),
+  "Cell counts per sample (Lineage3 by weights)")
+
+make_lineage_plot(lin4_cells,
+  c("Bud Tip","AT2_2","AT2_1","AT2_4"),
+  "Cell counts per sample (Lineage4 by weights)")
+```
+
+------------------------------------------------------------------------
+
+# Final Outputs
+
+```{r final-save-all}
+# Save all major analysis objects
+saveRDS(TF_fetal_nuc,                       file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_nuc_cluster.rds")
+saveRDS(TF_pediatric_nuc_subset,            file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_pediatric_nuc_subset_cluster.rds")
+saveRDS(TF_fetal_pediatric,                 file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_cluster.rds")
+saveRDS(TF_fetal_pediatric_epi_pre,         file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_pre.rds")
+saveRDS(TF_fetal_pediatric_epi_post,        file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_post.rds")
+saveRDS(TF_Alve_subset,                     file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_Alve_subset_cluster_v2.rds")
+saveRDS(cellchat,                           file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/cellchat_TF_Alve_subset.rds")
+saveRDS(sce_post,                           file = "/Users/amandawu/University of Michigan Dropbox/Amanda Wu/Spence Lab/Sequencing data/processed/TF_fetal_pediatric_epi_post_alve_sce.rds")
+```
+
+```{r session-info}
+sessionInfo()
+```

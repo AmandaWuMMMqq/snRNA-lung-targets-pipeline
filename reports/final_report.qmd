@@ -1,0 +1,318 @@
+---
+title: "Fetal–Pediatric Lung snRNA-seq: Final Analysis Report"
+subtitle: "Alveolar Lineage Development"
+author: "Spence Lab"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-float: true
+    theme: flatly
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(targets)
+library(yaml)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(patchwork)
+
+# Load config
+paths   <- tar_read(paths)
+params  <- tar_read(params)
+markers <- tar_read(markers)
+```
+
+> **Disclaimer:** This is an observational snRNA-seq study. Causal claims cannot
+> be made from trajectory or cell–cell communication analyses alone. Biological
+> interpretations are working hypotheses and should be validated experimentally.
+
+# Analysis Overview
+
+This pipeline analyzes pre-processed snRNA-seq data from fetal and pediatric human
+lung tissue. The primary goal is to characterize developmental trajectories of
+alveolar epithelial cells.
+
+**Two parallel epithelial analysis branches are maintained throughout:**
+
+- **Pre-merge (`pre`):** Epithelial cells subset from individual fetal and pediatric
+  objects before joint integration. This approach isolates contaminants per dataset
+  before merging.
+- **Post-merge (`post`):** Epithelial cells subset from the jointly integrated
+  fetal–pediatric object.
+
+Results from both branches are shown side-by-side where applicable.
+
+## Parameters Used
+
+```{r params-summary}
+knitr::kable(
+  data.frame(
+    Parameter = c("PCA dimensions", "Clustering resolution",
+                  "Integration method", "Normalization",
+                  "Trajectory start", "tradeSeq nknots",
+                  "Memory limit (GB)"),
+    Value     = c(params$seurat$dims, params$seurat$resolution,
+                  params$seurat$integration_method,
+                  params$seurat$normalization_method,
+                  params$trajectory$start_cluster,
+                  params$tradeseq$nknots,
+                  params$memory$future_globals_max_size_gb)
+  )
+)
+```
+
+---
+
+# Input Data Summary
+
+```{r input-audit}
+audit_dir <- paths$output$audit
+
+load_audit_safe <- function(name, audit_dir) {
+  f <- file.path(audit_dir, paste0(name, "_audit.yaml"))
+  if (!file.exists(f)) return(NULL)
+  yaml::read_yaml(f)
+}
+
+ia <- load_audit_safe("input", audit_dir)
+if (!is.null(ia)) {
+  knitr::kable(data.frame(
+    Metric = c("Fetal cells", "Fetal genes", "Fetal batches",
+               "Pediatric cells", "Pediatric genes", "Pediatric batches"),
+    Value  = c(ia$fetal_n_cells, ia$fetal_n_genes, ia$fetal_batches,
+               ia$ped_n_cells,   ia$ped_n_genes,   ia$ped_batches)
+  ))
+} else {
+  cat("Input audit not yet available — run the pipeline first.\n")
+}
+```
+
+---
+
+# Individual Processing Summary
+
+```{r individual-audit}
+iia <- load_audit_safe("individual_integration", audit_dir)
+if (!is.null(iia)) {
+  knitr::kable(data.frame(
+    Metric = c("Fetal cells (post-integration)", "Fetal reductions",
+               "Pediatric cells (post-integration)", "Pediatric reductions",
+               "Dims used", "Resolution"),
+    Value  = c(iia$fetal_n_cells, iia$fetal_reductions,
+               iia$ped_n_cells,   iia$ped_reductions,
+               iia$dims_used,     iia$resolution)
+  ))
+} else {
+  cat("Individual integration audit not yet available.\n")
+}
+```
+
+---
+
+# Joint Integration Summary
+
+```{r joint-audit}
+ja <- load_audit_safe("joint_integration", audit_dir)
+if (!is.null(ja)) {
+  knitr::kable(data.frame(
+    Metric = c("Total cells (joint)", "Cell types detected", "Lineages"),
+    Value  = c(ja$n_cells, ja$cell_types, ja$lineages)
+  ))
+} else {
+  cat("Joint integration audit not yet available.\n")
+}
+```
+
+---
+
+# Epithelial Branch Comparison
+
+```{r epi-audit}
+ea <- load_audit_safe("epithelial_branch", audit_dir)
+if (!is.null(ea)) {
+  knitr::kable(data.frame(
+    Branch     = c("Pre-merge", "Post-merge"),
+    `N cells`  = c(ea$pre_n_cells,  ea$post_n_cells),
+    `Cell types` = c(ea$pre_cell_types, ea$post_cell_types),
+    check.names = FALSE
+  ))
+} else {
+  cat("Epithelial branch audit not yet available.\n")
+}
+```
+
+**Interpretation note:** Pre-merge subsetting applies contaminant gene filters
+within each dataset before integration. Post-merge subsetting relies on the
+joint lineage annotation. Differences in cell counts and type composition
+between branches reflect this methodological choice, not biological differences.
+
+---
+
+# Alveolar Subset Summary
+
+```{r alve-audit}
+aa <- load_audit_safe("alveolar", audit_dir)
+if (!is.null(aa)) {
+  knitr::kable(data.frame(
+    Branch      = c("Pre-alveolar", "Post-alveolar"),
+    `N cells`   = c(aa$pre_n_cells,  aa$post_n_cells),
+    `Cell types` = c(aa$pre_cell_types, aa$post_cell_types),
+    check.names = FALSE
+  ))
+} else {
+  cat("Alveolar audit not yet available.\n")
+}
+```
+
+---
+
+# Key Figures
+
+## Pre-merge Alveolar UMAP
+
+```{r pre-umap, fig.width=12, fig.height=5}
+pre_umap_path <- file.path(paths$output$plots, "alveolar", "pre_alveolar_umap_panel.png")
+if (file.exists(pre_umap_path)) {
+  knitr::include_graphics(pre_umap_path)
+} else {
+  cat("UMAP not yet generated — run the pipeline first.\n")
+}
+```
+
+## Post-merge Alveolar UMAP
+
+```{r post-umap, fig.width=12, fig.height=5}
+post_umap_path <- file.path(paths$output$plots, "alveolar", "post_alveolar_umap_panel.png")
+if (file.exists(post_umap_path)) {
+  knitr::include_graphics(post_umap_path)
+} else {
+  cat("UMAP not yet generated — run the pipeline first.\n")
+}
+```
+
+---
+
+# Slingshot Trajectory Results
+
+```{r trajectory-audit}
+ta <- load_audit_safe("trajectory", audit_dir)
+if (!is.null(ta)) {
+  knitr::kable(data.frame(
+    Branch         = c("Pre", "Post"),
+    `N lineages`   = c(ta$pre_n_lineages,     ta$post_n_lineages),
+    `Lineage names` = c(ta$pre_lineage_names,  ta$post_lineage_names),
+    check.names = FALSE
+  ))
+} else {
+  cat("Trajectory audit not yet available.\n")
+}
+```
+
+**Methods note:** Slingshot trajectory inference starts from the Bud Tip
+progenitor cluster using minimum-spanning-tree lineage inference. Multiple
+start nodes and distance methods are explored. Pseudotime values are
+weighted averages across lineage curves.
+
+---
+
+# tradeSeq Pseudotime DE Results
+
+```{r tradeseq-audit}
+tsa <- load_audit_safe("tradeseq", audit_dir)
+if (!is.null(tsa)) {
+  knitr::kable(data.frame(
+    Metric  = c("Pre genes tested", "Post genes tested", "nknots", "Cores"),
+    Value   = c(tsa$pre_n_genes, tsa$post_n_genes, tsa$nknots, tsa$cores)
+  ))
+  cat("\n**Fix note:**", tsa$fix_note, "\n")
+} else {
+  cat("tradeSeq audit not yet available.\n")
+}
+```
+
+**Methods note:** GAMs were fit using variable features from the alveolar object.
+Tests include: association (any pseudotime association), startVsEnd (differential
+expression between start and end), pattern (pairwise lineage comparison), earlyDE
+(differential expression at early pseudotime), and diffEnd (differential end-point
+expression).
+
+```{r tradeseq-tables}
+tbl_dir <- file.path(paths$output$tables, "tradeseq")
+for (branch in c("pre", "post")) {
+  f <- file.path(tbl_dir, paste0(branch, "_tradeseq_startvsend_results.csv"))
+  if (file.exists(f)) {
+    res <- read.csv(f)
+    cat("### ", branch, "-branch: Top 20 startVsEnd genes\n\n")
+    print(knitr::kable(head(res[order(res$waldStat, decreasing = TRUE), ], 20)))
+    cat("\n")
+  }
+}
+```
+
+---
+
+# CellChat Results
+
+```{r cellchat-audit}
+cca <- load_audit_safe("cellchat", audit_dir)
+if (!is.null(cca)) {
+  knitr::kable(data.frame(
+    Branch    = c("Pre", "Post"),
+    Pathways  = c(cca$pre_pathways, cca$post_pathways),
+    check.names = FALSE
+  ))
+} else {
+  cat("CellChat audit not yet available.\n")
+}
+```
+
+**Pathways of interest:** BMP, TGFb, FGF — examined for signaling from Bud Tip
+and Transitional cells to AT2 subtypes.
+
+---
+
+# Cell Composition Analysis
+
+```{r composition-audit}
+compa <- load_audit_safe("composition", audit_dir)
+if (!is.null(compa)) {
+  knitr::kable(data.frame(
+    Branch   = c("Pre-alveolar", "Post-alveolar"),
+    `N cells` = c(compa$pre_n_cells, compa$post_n_cells),
+    check.names = FALSE
+  ))
+} else {
+  cat("Composition audit not yet available.\n")
+}
+```
+
+---
+
+# Audit Summary
+
+```{r audit-summary}
+source("R/12_audit.R")
+all_audits <- consolidate_audits(paths$output$audit)
+cat("Total audit records:", length(all_audits), "\n")
+cat("Modules audited:", paste(names(all_audits), collapse = ", "), "\n")
+```
+
+Full audit details are available in `outputs/audit/`. See `module_audit_report.html`
+for a structured per-module breakdown.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```

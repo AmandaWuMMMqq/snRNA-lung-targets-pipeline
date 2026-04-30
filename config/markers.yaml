@@ -1,0 +1,129 @@
+lineage_markers:
+  epithelium:
+    - EPCAM
+    - KRT8
+    - KRT18
+  mesenchyme:
+    - COL1A1
+    - COL1A2
+    - DCN
+    - PDGFRA
+  immune:
+    - PTPRC
+  endothelium:
+    - PECAM1
+    - VWF
+    - CLDN5
+    - CD34
+
+alveolar_markers:
+  AT1:
+    - AGER
+    - PDPN
+    - CAV1
+    - EMP2
+  AT2:
+    - SFTPC
+    - SFTPB
+    - SFTPA1
+    - SFTPA2
+    - ABCA3
+    - NAPSA
+    - LAMP3
+  bud_tip:
+    - SOX9
+    - ID2
+    - TESC
+    - CPM
+    - ETV5
+    - NPC2
+  transitional:
+    - SCGB3A2
+    - CP
+    - CFTR
+    - FMO5
+  LAP:
+    - SCGB3A2
+    - CP
+    - CFTR
+
+cell_type_gene_sets:
+  AT2:
+    - SFTPC
+    - SFTPB
+    - SFTPA1
+    - SFTPA2
+    - LAMP3
+    - NAPSA
+  AT1:
+    - AGER
+    - CAV1
+    - EMP2
+    - PDPN
+  Basal:
+    - TP63
+    - KRT5
+  LAP:
+    - SCGB3A2
+    - CP
+    - CFTR
+  BudTip:
+    - SOX9
+    - TESC
+    - CPM
+    - ETV5
+    - NPC2
+  Ciliated:
+    - FOXJ1
+    - CAPS
+    - SNTN
+  Fibroblasts:
+    - COL3A1
+    - FBN1
+    - LUM
+  Endo:
+    - CD34
+    - PECAM1
+    - VWF
+  Club:
+    - BPIFB1
+    - CYP4B1
+    - SCGB3A1
+    - MUC15
+  SmoothMuscle:
+    - ACTA2
+    - ACTG2
+    - CNN1
+    - MYH11
+  PNEC:
+    - CHGA
+    - ASCL1
+  Alve:
+    - SFTPC
+    - SFTPB
+    - LAMP3
+    - NAPSA
+    - SOX9
+    - TESC
+    - AGER
+    - PDPN
+
+dotplot_genes:
+  - SOX9
+  - TESC
+  - CPM
+  - ETV5
+  - NPC2
+  - SFTPC
+  - SFTPB
+  - SFTPA1
+  - SFTPA2
+  - LAMP3
+  - NAPSA
+  - AGER
+  - CAV1
+  - EMP2
+  - PDPN
+  - SCGB3A2
+  - CP
+  - CFTR

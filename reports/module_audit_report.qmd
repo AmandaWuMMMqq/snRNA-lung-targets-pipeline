@@ -1,0 +1,86 @@
+---
+title: "Module Audit Report"
+subtitle: "snRNA-seq Fetal–Pediatric Lung Analysis"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: flatly
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(yaml)
+library(dplyr)
+library(knitr)
+library(targets)
+
+audit_dir <- tar_read(paths)$output$audit
+```
+
+# Overview
+
+This report summarizes the audit records generated at each pipeline stage.
+Each module writes a YAML, CSV, and Markdown audit file to `outputs/audit/`.
+
+```{r list-audits}
+source("R/12_audit.R")
+all_audits <- consolidate_audits(audit_dir)
+cat("Audit files found:", length(all_audits), "\n")
+cat(paste("-", names(all_audits), collapse = "\n"))
+```
+
+# Code Fix Log
+
+Issues identified in the original R Markdown and fixed during modularization:
+
+```{r fix-log}
+fix_log_path <- file.path(audit_dir, "code_fix_log.yaml")
+if (file.exists(fix_log_path)) {
+  fixes <- yaml::read_yaml(fix_log_path)
+  for (f in fixes) {
+    cat("**Issue:**", f$issue, "\n\n")
+    cat("**Location:**", f$location, "\n\n")
+    cat("**Original:**", f$original, "\n\n")
+    cat("**Fix:**", f$fix, "\n\n---\n\n")
+  }
+} else {
+  cat("Fix log not yet generated — run the pipeline first.\n")
+}
+```
+
+# Per-Module Audit Summaries
+
+```{r module-tables, results='asis'}
+if (length(all_audits) == 0) {
+  cat("No audit files found. Run the pipeline to generate audit records.\n")
+} else {
+  for (nm in names(all_audits)) {
+    a <- all_audits[[nm]]
+    cat("## Module:", nm, "\n\n")
+    tbl <- data.frame(
+      Key   = names(a),
+      Value = sapply(a, function(v) {
+        if (is.null(v)) "null"
+        else if (length(v) > 1) paste(v, collapse = ", ")
+        else as.character(v)
+      }),
+      stringsAsFactors = FALSE
+    )
+    print(knitr::kable(tbl, row.names = FALSE))
+    cat("\n\n")
+  }
+}
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
