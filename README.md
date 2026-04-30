@@ -2,6 +2,10 @@
 
 A modular, reproducible [`{targets}`](https://docs.ropensci.org/targets/) pipeline for single-nucleus RNA sequencing analysis of fetal and pediatric human lung tissue. The analysis characterizes developmental trajectories of alveolar epithelial cells using Seurat, Slingshot, tradeSeq, CellChat, and cell composition analyses.
 
+> **Two workflows are available** — choose the one that fits your needs:
+> - **Interactive Rmd** ([`snRNA_interactive_analysis.Rmd`](snRNA_interactive_analysis.Rmd)) — single file, run chunk-by-chunk in RStudio, plots appear inline. Best for exploration and parameter tuning.
+> - **`{targets}` pipeline** (`_targets.R` + `R/`) — fully automated, cached, reproducible. Best for final runs and HPC.
+>
 > The original monolithic R Markdown workflow is preserved in [`archive/`](archive/).
 
 ---
@@ -27,10 +31,41 @@ Results from both branches are tracked and compared throughout the pipeline.
 
 ---
 
+## Interactive R Markdown
+
+[`snRNA_interactive_analysis.Rmd`](snRNA_interactive_analysis.Rmd) is a self-contained alternative to the `{targets}` pipeline. Open it in RStudio and run chunks one at a time — plots render inline.
+
+### How it works
+
+1. **Edit the CONFIG chunk** (Section 0) — every parameter lives there, nowhere else:
+   - `PATH_fetal_raw` / `PATH_pediatric_raw` — input RDS paths
+   - `CKPT_*` — checkpoint paths (set `NULL` to compute, or a file path to load a saved object and skip that step)
+   - `SAVE_*` — where to write objects after computing (`NULL` = don't save)
+   - Integration params: `DIMS`, `RESOLUTION`, `VARS_TO_REGRESS`, `PED_DOWNSAMPLE_N`
+   - Annotation maps: `ANNOT_FETAL_LINEAGE`, `ANNOT_JOINT_CELLTYPE`, etc.
+   - Trajectory, tradeSeq, CellChat, and plot settings
+
+2. **Run the CONFIG chunk**, then step through sections in order.
+
+3. **Load pre-computed objects** at any stage by setting the matching `CKPT_*` variable:
+
+   | Variable | Object type |
+   |----------|-------------|
+   | `CKPT_fetal_integrated` | Seurat (fetal, integrated) |
+   | `CKPT_joint_integrated` | Seurat (joint fetal–pediatric) |
+   | `CKPT_epi_pre` / `CKPT_epi_post` | Seurat (epithelial subset) |
+   | `CKPT_alve_pre` / `CKPT_alve_post` | Seurat (alveolar subset) |
+   | `CKPT_sds_pre` / `CKPT_sds_post` | `SlingshotDataSet` |
+   | `CKPT_sce_pre` / `CKPT_sce_post` | `SingleCellExperiment` (tradeSeq) |
+   | `CKPT_cellchat_pre` / `CKPT_cellchat_post` | `CellChat` object |
+
+---
+
 ## Repository Structure
 
 ```
 .
+├── snRNA_interactive_analysis.Rmd  # Interactive single-file workflow
 ├── _targets.R                  # Pipeline dependency graph (~50 targets)
 ├── config/
 │   ├── paths.yaml              # Input/output paths — edit before running
@@ -73,9 +108,15 @@ Results from both branches are tracked and compared throughout the pipeline.
 
 ## Quickstart
 
-### 1. Set your data paths
+### Option A — Interactive Rmd (exploration / parameter tuning)
 
-Edit `config/paths.yaml`:
+1. Open `snRNA_interactive_analysis.Rmd` in RStudio.
+2. Edit the **CONFIG chunk** (Section 0): set `PATH_fetal_raw`, `PATH_pediatric_raw`, and any `CKPT_*` paths for pre-computed objects you already have.
+3. Run the CONFIG chunk, then step through sections with **Ctrl/Cmd + Shift + Enter**. Plots appear inline.
+
+### Option B — `{targets}` pipeline (automated / reproducible)
+
+**1. Set your data paths** — edit `config/paths.yaml`:
 
 ```yaml
 input:
@@ -83,7 +124,7 @@ input:
   pediatric_rds: "/path/to/TF_ped_nuc.rds"
 ```
 
-### 2. Run the full pipeline
+**2. Run the full pipeline:**
 
 ```r
 library(targets)
@@ -96,7 +137,7 @@ or from the terminal:
 Rscript scripts/run_pipeline.R
 ```
 
-### 3. Run a single module
+**3. Run a single module:**
 
 ```bash
 Rscript scripts/run_module.R trajectory
@@ -106,7 +147,7 @@ Rscript scripts/run_module.R final_report
 
 Available modules: `config`, `input`, `individual_integration`, `annotation`, `joint_integration`, `epithelial`, `alveolar`, `trajectory`, `tradeseq`, `cellchat`, `composition`, `final_plots`, `final_tables`, `audit_report`, `final_report`
 
-### 4. Check pipeline status
+**4. Check pipeline status:**
 
 ```r
 library(targets)
