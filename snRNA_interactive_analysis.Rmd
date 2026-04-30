@@ -1,0 +1,1376 @@
+---
+title: "snRNA-seq Interactive Analysis — Fetal–Pediatric Lung"
+author: "Spence Lab"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    number_sections: true
+    code_folding: show
+editor_options:
+  chunk_output_type: inline
+---
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     HOW TO USE THIS FILE
+     ───────────────────
+     1. Edit Section 0 (the CONFIG chunk below). Set all paths, checkpoints,
+        and parameters there — nowhere else.
+     2. Run chunks one at a time in RStudio (Ctrl/Cmd + Shift + Enter).
+     3. Checkpoints: set CKPT_* to NULL to compute from scratch, or provide
+        a file path to skip heavy steps and load a saved object instead.
+     4. Save paths: set SAVE_* to NULL to skip saving, or provide a path.
+     ═══════════════════════════════════════════════════════════════════════ -->
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(tidytext)
+library(ggplot2)
+library(patchwork)
+library(Seurat)
+library(SeuratWrappers)
+library(sctransform)
+library(slingshot)
+library(SingleCellExperiment)
+library(tradeSeq)
+library(BiocParallel)
+library(RColorBrewer)
+library(viridis)
+library(ComplexHeatmap)
+library(ggridges)
+library(ggrepel)
+library(ggnewscale)
+library(cowplot)
+library(circlize)
+library(presto)
+library(writexl)
+library(CellChat)
+library(NMF)
+library(ggalluvial)
+library(R.utils)
+```
+
+---
+
+# 0 · Configuration {.tabset}
+
+> **Edit everything in this chunk, then run it first.**
+
+```{r CONFIG}
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  USER CONFIG — edit here, run once, then step through the sections      ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+set.seed(123)
+options(future.globals.maxSize = 40 * 1024^3)   # 40 GB; increase if needed
+
+
+# ── Input data paths ──────────────────────────────────────────────────────────
+PATH_fetal_raw     <- "PATH/TO/TF_fetal_nuc.rds"
+PATH_pediatric_raw <- "PATH/TO/TF_ped_nuc.rds"
+
+
+# ── Checkpoint paths ──────────────────────────────────────────────────────────
+# Set to NULL → compute from scratch.
+# Set to a file path → load that file and skip the heavy computation.
+
+CKPT_fetal_integrated   <- NULL   # e.g. "outputs/rds/fetal_integrated.rds"
+CKPT_ped_integrated     <- NULL   # e.g. "outputs/rds/ped_integrated.rds"
+CKPT_joint_integrated   <- NULL   # e.g. "outputs/rds/joint_integrated.rds"
+CKPT_epi_pre            <- NULL   # e.g. "outputs/rds/epi_pre.rds"
+CKPT_epi_post           <- NULL   # e.g. "outputs/rds/epi_post.rds"
+CKPT_alve_pre           <- NULL   # e.g. "outputs/rds/pre_alve.rds"
+CKPT_alve_post          <- NULL   # e.g. "outputs/rds/post_alve.rds"
+CKPT_sds_pre            <- NULL   # Slingshot SlingshotDataSet (pre)
+CKPT_sds_post           <- NULL   # Slingshot SlingshotDataSet (post)
+CKPT_sce_pre            <- NULL   # tradeSeq SCE (pre)
+CKPT_sce_post           <- NULL   # tradeSeq SCE (post)
+CKPT_cellchat_pre       <- NULL   # CellChat object (pre)
+CKPT_cellchat_post      <- NULL   # CellChat object (post)
+
+
+# ── Save paths ────────────────────────────────────────────────────────────────
+# Set to NULL to skip saving. Set to a file path to save after computing.
+
+SAVE_fetal_integrated   <- NULL   # e.g. "outputs/rds/fetal_integrated.rds"
+SAVE_ped_integrated     <- NULL
+SAVE_joint_integrated   <- NULL
+SAVE_epi_pre            <- NULL
+SAVE_epi_post           <- NULL
+SAVE_alve_pre           <- NULL
+SAVE_alve_post          <- NULL
+SAVE_sds_pre            <- NULL
+SAVE_sds_post           <- NULL
+SAVE_sce_pre            <- NULL
+SAVE_sce_post           <- NULL
+SAVE_cellchat_pre       <- NULL
+SAVE_cellchat_post      <- NULL
+
+
+# ── Integration parameters ────────────────────────────────────────────────────
+DIMS              <- 30
+RESOLUTION        <- 0.5
+VARS_TO_REGRESS   <- "percent.mt"
+PED_DOWNSAMPLE_N  <- 27411   # pediatric cells to downsample to (match fetal)
+
+
+# ── Contaminant gene filters (applied when subsetting epithelium) ─────────────
+# Names = gene, values = expression threshold (cells above threshold excluded)
+CONTAMINANT_GENES <- c(
+  CLDN5  = 0.1,
+  VWF    = 0.1,
+  PTPRC  = 0.1,
+  COL1A2 = 0.1,
+  PECAM1 = 0.1,
+  PDGFRA = 0.1
+)
+
+
+# ── Cell type labels to keep in the alveolar subset ───────────────────────────
+ALVEOLAR_LABELS <- c(
+  "AT1_1","AT1_2","AT1_3","AT1_4","AT1_5","AT1_6",
+  "AT2_1","AT2_2","AT2_3","AT2_4","AT2_6","AT2_7",
+  "Bud Tip",
+  "Transitional","Transitional_1","Transitional_2",
+  "Transitional_3","Transitional_4",
+  "Transitional/Bud Tip Adjacent"
+)
+
+
+# ── Trajectory parameters ─────────────────────────────────────────────────────
+TRAJ_START        <- "Bud Tip"    # starting cluster for Slingshot
+TRAJ_DIST         <- "mnn"        # distance method: "mnn" or "slingshot"
+TRAJ_DIST_2       <- "slingshot"  # secondary distance for comparison run
+TRAJ_APPROX_PTS   <- 150
+TRAJ_THRESH       <- 0.01
+TRAJ_STRETCH      <- 0.8
+TRAJ_SHRINK       <- 0.99
+TRAJ_CLUSTER_COL  <- "cell_type2" # metadata column with cell type labels
+
+# Lineage subsets to keep from each Slingshot run (NULL = keep all)
+BT_MNN_LINEAGES   <- c(1, 3, 4)
+T2_MNN_LINEAGE    <- 4
+BT_SLING_LINEAGES <- c(2, 3)
+T1_SLING_LINEAGE  <- 3
+
+
+# ── tradeSeq parameters ───────────────────────────────────────────────────────
+TRADESEQ_NKNOTS   <- 8
+TRADESEQ_CORES    <- 10
+TRADESEQ_GENES    <- NULL   # NULL = use VariableFeatures(); or provide a character vector
+
+# Genes to visualize smoothers for interactively
+SMOOTHER_GENES    <- c("CFTR", "SFTPC", "AGER", "SOX9")
+
+# Pseudotime ridge: which cell types to show per lineage
+RIDGE_KEEP <- list(
+  Lineage1 = c("Bud Tip","AT2_1","AT2_2","Transitional_1","AT1_1","AT1_2"),
+  Lineage2 = c("Bud Tip","AT2_1","AT2_2","Transitional_2"),
+  Lineage3 = c("Bud Tip","AT2_1","AT2_2","AT2_4"),
+  Lineage4 = c("Bud Tip","AT2_3")
+)
+
+# Heatmap: cell type order per lineage
+HT_LINEAGE_ORDER <- list(
+  Lineage1 = c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_1","AT1_2"),
+  Lineage2 = c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_3"),
+  Lineage3 = c("Bud Tip","AT2_2","AT2_1","AT2_3"),
+  Lineage4 = c("Bud Tip","AT2_2","AT2_1","AT2_4")
+)
+
+
+# ── CellChat parameters ───────────────────────────────────────────────────────
+CC_LABEL_COL        <- "cell_type2"  # metadata column for cell type labels
+CC_SAMPLE_COL       <- "batch"
+CC_MIN_CELLS        <- 10
+CC_PATHWAYS         <- c("BMP","TGFb","FGF")  # pathways to visualize
+CC_N_OUT_PATTERNS   <- 6
+CC_N_IN_PATTERNS    <- 2
+CC_SOURCES          <- c("Bud Tip","Transitional")  # bubble plot sources
+CC_TARGETS          <- c("AT2_1","AT2_2","AT2_3","AT2_4")  # bubble plot targets
+CC_CLUSTER_ORDER    <- c("Bud Tip","Transitional",
+                          "AT2_1","AT2_2","AT2_3","AT2_4",
+                          "AT1_1","AT1_2","AT1_3","AT1_4","AT1_5")
+
+
+# ── Marker gene sets for FeaturePlots ─────────────────────────────────────────
+MARKER_SETS <- list(
+  AT2      = c("SFTPC","SFTPB","SFTPA1","SFTPA2","LAMP3","NAPSA"),
+  AT1      = c("AGER","CAV1","EMP2","PDPN"),
+  BudTip   = c("SOX9","TESC","CPM","ETV5","NPC2"),
+  LAP      = c("SCGB3A2","CP","CFTR"),
+  Ciliated = c("FOXJ1","CAPS","SNTN"),
+  Endo     = c("CD34","PECAM1","VWF"),
+  Alve     = c("SFTPC","SFTPB","LAMP3","NAPSA","SOX9","TESC","AGER","PDPN")
+)
+
+DOTPLOT_GENES <- c(
+  "SOX9","TESC","CPM","ETV5","NPC2",
+  "SFTPC","SFTPB","SFTPA1","SFTPA2","LAMP3","NAPSA",
+  "AGER","CAV1","EMP2","PDPN",
+  "SCGB3A2","CP","CFTR"
+)
+
+
+# ── Cluster annotation maps ───────────────────────────────────────────────────
+# !! Update these when you re-cluster with different parameters !!
+
+ANNOT_FETAL_LINEAGE <- c(
+  "0"="Mesenchyme","1"="Mesenchyme","2"="Mesenchyme","3"="Mesenchyme",
+  "4"="Epithelium","5"="Epithelium","6"="Epithelium","7"="Mesenchyme",
+  "8"="Endothelium","9"="Mesenchyme","10"="Mesenchyme","11"="Immune",
+  "12"="Epithelium","13"="Endothelium","14"="Immune","15"="Endothelium",
+  "16"="Mesenchyme","17"="Epithelium","18"="Immune","19"="Endothelium"
+)
+
+ANNOT_PED_LINEAGE <- c(
+  "0"="Epithelium","1"="Epithelium","2"="Epithelium","3"="Epithelium",
+  "4"="Epithelium","5"="Mesenchyme","6"="Immune","7"="Epithelium",
+  "8"="Endothelium","9"="Epithelium","10"="Immune","11"="Epithelium",
+  "12"="Epithelium","13"="Immune","14"="Epithelium","15"="Immune",
+  "16"="Endothelium","17"="Epithelium","18"="Endothelium","19"="Epithelium",
+  "20"="Epithelium","21"="Epithelium","22"="Mesenchyme","23"="Mesenchyme",
+  "24"="Epithelium","25"="Mesenchyme","26"="Mesenchyme","27"="Epithelium",
+  "28"="Epithelium"
+)
+
+ANNOT_JOINT_CELLTYPE <- c(
+  "0"="Fibroblast_1","1"="Fibroblast_2","2"="AT2_1","3"="AT1_1","4"="AT1_2",
+  "5"="AT2_2","6"="Fibroblast_3","7"="Macrophage_1","8"="LAP","9"="Multiciliated",
+  "10"="AT2_3","11"="Endothelial_1","12"="Transitional AT2","13"="Fibroblast_4",
+  "14"="T-cell","15"="Low-quality/Dying/doublets","16"="Macrophage_2",
+  "17"="Endothelial_2 (Capillary Aerocyte)","18"="Endothelial_3 (Lymphatic)",
+  "19"="Monocytes","20"="Endothelial_4 (Pericyte)","21"="AT1_3","22"="Fibroblast_4",
+  "23"="Basal","24"="Neutrophils","25"="B-cell","26"="Neuroendocrine",
+  "27"="Unknown","28"="Endothelial_5"
+)
+
+ANNOT_JOINT_LINEAGE <- c(
+  "0"="Mesenchyme","1"="Epithelium","2"="Epithelium","3"="Epithelium",
+  "4"="Epithelium","5"="Mesenchyme","6"="Epithelium","7"="Immune",
+  "8"="Mesenchyme","9"="Endothelium","10"="Epithelium","11"="Mesenchyme",
+  "12"="Epithelium","13"="Immune","14"="Epithelium","15"="Epithelium",
+  "16"="Epithelium","17"="Endothelium","18"="Immune","19"="Endothelium",
+  "20"="Mesenchyme","21"="Endothelium","22"="Epithelium","23"="Immune",
+  "24"="Immune","25"="Epithelium","26"="Epithelium"
+)
+
+ANNOT_EPI_POST_CELLTYPE <- c(
+  "0"="AT2_1","1"="AT1_1","2"="LAP_1","3"="AT1_2","4"="AT2_2",
+  "5"="Transitional_1","6"="Multiciliated","7"="AT2_3","8"="LAP_2",
+  "9"="Transitional_2","10"="Endothelial_1","11"="Endothelial_2",
+  "12"="AT1_3","13"="Basal","14"="Macrophages","15"="Neuroendocrine"
+)
+
+# Pre-alveolar subset annotation (16 clusters at res 0.6)
+ANNOT_PRE_ALVE_CELLTYPE2 <- c(
+  "0"="AT2_1","1"="Bud Tip","2"="AT1_1","3"="AT1_2","4"="AT1_3",
+  "5"="AT2_2","6"="AT2_3","7"="AT2_4","8"="Transitional_1",
+  "9"="Transitional_2","10"="Transitional_3","11"="Transitional_4",
+  "12"="AT1_5","13"="AT2_6","14"="AT2_7","15"="AT1_6"
+)
+
+# Post-alveolar subset annotation (9 clusters)
+ANNOT_POST_ALVE_CELLTYPE2 <- c(
+  "0"="AT2_1","1"="AT1_1","2"="AT2_2","3"="Transitional_1",
+  "4"="AT1_2","5"="Transitional_2","6"="AT2_4","7"="Bud Tip","8"="AT2_5"
+)
+
+# Additional celltype3 annotation for post-alve (collapsed Transitional/Bud Tip)
+ANNOT_POST_ALVE_CELLTYPE3 <- c(
+  "0"="AT2_1","1"="AT1_1","2"="AT2_2","3"="AT2_3","4"="AT1_2",
+  "5"="Transitional","6"="Bud Tip","7"="AT1_5","8"="AT2_4",
+  "9"="AT1_3","10"="AT1_4"
+)
+
+# ── Plot settings ─────────────────────────────────────────────────────────────
+FIG_W     <- 12
+FIG_H     <- 8
+PT_SIZE   <- 0.5
+RASTER    <- FALSE   # TRUE speeds up rendering for large datasets
+
+# Sequential color gradient (used in FeaturePlots and pseudotime)
+MY_COLORS <- scale_color_gradientn(colors = c(
+  "lightgrey","#EDF8B1","#C7E9B4","#7FCDBB","#41B6C4",
+  "#1D91C0","#225EA8","#253494","#081D58"
+))
+MY_COLORS_FN <- colorRampPalette(rev(c(
+  "#EDF8B1","#C7E9B4","#7FCDBB","#41B6C4",
+  "#1D91C0","#225EA8","#253494","#081D58"
+)))
+
+# Group colors
+COL_FETAL <- "#6A3D9A"
+COL_PED   <- "#F28E2B"
+
+cat("✓ Config loaded.\n")
+```
+
+```{r helpers, include=FALSE}
+# Internal helpers — no need to edit
+
+scale01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (!is.finite(rng[1]) || !is.finite(rng[2]) || rng[2] == rng[1])
+    return(rep(NA_real_, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+combined_pt_from_sds <- function(sds, cells) {
+  pt <- slingPseudotime(sds)
+  w  <- slingCurveWeights(sds)
+  pt <- pt[cells, , drop = FALSE]
+  w  <- w[cells,  , drop = FALSE]
+  pt_scaled <- apply(pt, 2, scale01)
+  w_sum     <- rowSums(w, na.rm = TRUE)
+  pt_one    <- rowSums(pt_scaled * w, na.rm = TRUE) / w_sum
+  pt_one[!is.finite(pt_one)] <- NA_real_
+  pt_one
+}
+
+normalize_labels <- function(x) {
+  x <- as.character(x); x <- trimws(x); x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x); x <- gsub("^_|_$", "", x); x
+}
+
+run_integration <- function(obj, dims = DIMS, resolution = RESOLUTION,
+                             split_by = "batch", regress = VARS_TO_REGRESS) {
+  DefaultAssay(obj) <- "RNA"
+  obj <- JoinLayers(obj)
+  obj[["RNA"]] <- split(obj[["RNA"]], f = obj@meta.data[[split_by]])
+  obj <- SCTransform(obj, vars.to.regress = regress, verbose = FALSE)
+  obj <- RunPCA(obj, dims = seq_len(dims), verbose = FALSE)
+  obj <- IntegrateLayers(obj, method = RPCAIntegration,
+                          normalization.method = "SCT", verbose = FALSE)
+  obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  red <- if ("integrated.dr" %in% names(obj@reductions)) "integrated.dr" else "pca"
+  obj <- FindNeighbors(obj, dims = seq_len(dims), reduction = red, verbose = FALSE)
+  obj <- FindClusters(obj, resolution = resolution)
+  obj <- RunUMAP(obj, dims = seq_len(dims), reduction = red)
+  obj
+}
+
+load_or_compute <- function(ckpt, compute_fn, save_path = NULL, label = "") {
+  if (!is.null(ckpt) && file.exists(ckpt)) {
+    message("✓ [", label, "] Loading checkpoint: ", ckpt)
+    readRDS(ckpt)
+  } else {
+    message("⟳ [", label, "] Computing ...")
+    obj <- compute_fn()
+    if (!is.null(save_path)) {
+      dir.create(dirname(save_path), recursive = TRUE, showWarnings = FALSE)
+      saveRDS(obj, save_path)
+      message("  Saved → ", save_path)
+    }
+    obj
+  }
+}
+
+build_contaminant_expr <- function(gene_thresholds) {
+  paste(
+    mapply(function(g, t) sprintf("%s < %g", g, t),
+           names(gene_thresholds), gene_thresholds),
+    collapse = " & "
+  )
+}
+
+quick_dimplots <- function(obj, group_vars, prefix = "") {
+  plots <- lapply(group_vars, function(gv) {
+    if (!gv %in% colnames(obj@meta.data)) return(NULL)
+    DimPlot(obj, group.by = gv, reduction = "umap",
+            label = FALSE, raster = RASTER, pt.size = PT_SIZE) +
+      theme_void() + ggtitle(paste0(prefix, gv))
+  })
+  plots <- Filter(Negate(is.null), plots)
+  wrap_plots(plots, ncol = 2)
+}
+
+scale_rows <- function(x) {
+  m <- rowMeans(x, na.rm = TRUE)
+  s <- apply(x, 1, sd, na.rm = TRUE); s[s == 0 | is.na(s)] <- 1
+  sweep(sweep(x, 1, m, "-"), 1, s, "/")
+}
+```
+
+---
+
+# 1 · Data Input
+
+```{r load-raw}
+TF_fetal_nuc     <- readRDS(PATH_fetal_raw)
+TF_pediatric_nuc <- readRDS(PATH_pediatric_raw)
+
+cat("Fetal:    ", ncol(TF_fetal_nuc), "cells ×", nrow(TF_fetal_nuc), "genes\n")
+cat("Pediatric:", ncol(TF_pediatric_nuc), "cells ×", nrow(TF_pediatric_nuc), "genes\n")
+cat("\nFetal metadata columns:\n"); print(colnames(TF_fetal_nuc@meta.data))
+cat("\nPediatric metadata columns:\n"); print(colnames(TF_pediatric_nuc@meta.data))
+cat("\nFetal cells per batch:\n"); print(table(TF_fetal_nuc$batch))
+cat("\nPediatric cells per batch:\n"); print(table(TF_pediatric_nuc$batch))
+```
+
+---
+
+# 2 · Individual Integration {.tabset}
+
+## 2a · Fetal
+
+```{r integrate-fetal}
+TF_fetal_nuc <- load_or_compute(
+  ckpt       = CKPT_fetal_integrated,
+  save_path  = SAVE_fetal_integrated,
+  label      = "fetal integration",
+  compute_fn = function() run_integration(TF_fetal_nuc)
+)
+```
+
+```{r plot-fetal, fig.width=FIG_W, fig.height=FIG_H}
+quick_dimplots(TF_fetal_nuc,
+               c("seurat_clusters","batch","sex","age","TF_annotation"),
+               prefix = "Fetal – ")
+```
+
+## 2b · Pediatric
+
+```{r integrate-pediatric}
+# Downsample then integrate
+TF_pediatric_nuc_subset <- load_or_compute(
+  ckpt       = CKPT_ped_integrated,
+  save_path  = SAVE_ped_integrated,
+  label      = "pediatric integration",
+  compute_fn = function() {
+    set.seed(123)
+    sub <- subset(TF_pediatric_nuc,
+                  cells = sample(colnames(TF_pediatric_nuc), PED_DOWNSAMPLE_N))
+    run_integration(sub)
+  }
+)
+cat("Pediatric (downsampled):", ncol(TF_pediatric_nuc_subset), "cells\n")
+```
+
+```{r plot-pediatric, fig.width=FIG_W, fig.height=FIG_H}
+quick_dimplots(TF_pediatric_nuc_subset,
+               c("seurat_clusters","batch","sex","age",
+                 "TF_annotation_lvl1","TF_annotation_lvl2","TF_annotation_lvl3"),
+               prefix = "Pediatric – ")
+```
+
+---
+
+# 3 · Lineage Annotation
+
+```{r annotate-fetal}
+TF_fetal_nuc@meta.data$lineage_lvl1 <-
+  ANNOT_FETAL_LINEAGE[as.character(TF_fetal_nuc$seurat_clusters)]
+
+DimPlot(TF_fetal_nuc, group.by = "lineage_lvl1",
+        reduction = "umap", label = FALSE, raster = RASTER) +
+  theme_void() + ggtitle("Fetal – Lineage")
+```
+
+```{r annotate-pediatric}
+TF_pediatric_nuc_subset@meta.data$lineage_lvl1 <-
+  ANNOT_PED_LINEAGE[as.character(TF_pediatric_nuc_subset$seurat_clusters)]
+
+DimPlot(TF_pediatric_nuc_subset, group.by = "lineage_lvl1",
+        reduction = "umap", label = FALSE, raster = RASTER) +
+  theme_void() + ggtitle("Pediatric – Lineage")
+```
+
+---
+
+# 4 · Joint Fetal–Pediatric Integration
+
+```{r integrate-joint}
+TF_fetal_pediatric <- load_or_compute(
+  ckpt       = CKPT_joint_integrated,
+  save_path  = SAVE_joint_integrated,
+  label      = "joint integration",
+  compute_fn = function() {
+    merged <- merge(TF_fetal_nuc, TF_pediatric_nuc_subset)
+    run_integration(merged)
+  }
+)
+cat("Joint object:", ncol(TF_fetal_pediatric), "cells\n")
+```
+
+```{r annotate-joint}
+TF_fetal_pediatric$cluster   <- Idents(TF_fetal_pediatric)
+TF_fetal_pediatric$cell_type <- ANNOT_JOINT_CELLTYPE[as.character(TF_fetal_pediatric$cluster)]
+TF_fetal_pediatric$lineage_lvl2 <- ANNOT_JOINT_LINEAGE[as.character(TF_fetal_pediatric$cluster)]
+```
+
+```{r plot-joint, fig.width=FIG_W*2, fig.height=FIG_H}
+quick_dimplots(TF_fetal_pediatric,
+               c("seurat_clusters","lineage_lvl2","cell_type","group","batch"),
+               prefix = "Joint – ")
+```
+
+```{r joint-annotation-crosswalk}
+# Dominant TF annotation per cluster — use this table to review and update
+# ANNOT_JOINT_CELLTYPE above if needed.
+TF_fetal_pediatric@meta.data %>%
+  filter(!is.na(TF_annotation_lvl1)) %>%
+  group_by(cluster, TF_annotation_lvl1) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  slice_max(pct, n = 1, with_ties = FALSE) %>%
+  arrange(as.numeric(as.character(cluster)))
+```
+
+---
+
+# 5 · Epithelial Subsetting {.tabset}
+
+## 5a · Pre-merge (subset → merge → integrate)
+
+```{r epi-pre}
+TF_fetal_pediatric_epi_pre <- load_or_compute(
+  ckpt       = CKPT_epi_pre,
+  save_path  = SAVE_epi_pre,
+  label      = "epi pre-merge",
+  compute_fn = function() {
+    # Build contaminant filter expression
+    cont_expr <- build_contaminant_expr(CONTAMINANT_GENES)
+    fetal_filt <- sprintf("lineage_lvl1 == 'Epithelium' & %s", cont_expr)
+    ped_filt   <- sprintf("lineage_lvl1 == 'Epithelium' & %s", cont_expr)
+
+    fetal_epi <- subset(TF_fetal_nuc,
+                         subset = eval(str2expression(fetal_filt)))
+    ped_epi   <- subset(TF_pediatric_nuc_subset,
+                         subset = eval(str2expression(ped_filt)))
+
+    cat("Fetal epithelial cells:    ", ncol(fetal_epi), "\n")
+    cat("Pediatric epithelial cells:", ncol(ped_epi),   "\n")
+
+    merged <- merge(fetal_epi, ped_epi)
+    DefaultAssay(merged) <- "RNA"
+    run_integration(merged)
+  }
+)
+cat("Pre-merge epi:", ncol(TF_fetal_pediatric_epi_pre), "cells\n")
+```
+
+```{r plot-epi-pre, fig.width=FIG_W, fig.height=FIG_H}
+quick_dimplots(TF_fetal_pediatric_epi_pre,
+               c("seurat_clusters","batch","sex","group","TF_annotation"),
+               prefix = "Epi Pre – ")
+```
+
+## 5b · Post-merge (joint object → subset → integrate)
+
+```{r epi-post}
+TF_fetal_pediatric_epi_post <- load_or_compute(
+  ckpt       = CKPT_epi_post,
+  save_path  = SAVE_epi_post,
+  label      = "epi post-merge",
+  compute_fn = function() {
+    # Fix: explicit assignment of contaminant-filtered subset (bug from original)
+    cont_expr <- build_contaminant_expr(CONTAMINANT_GENES)
+    filt_expr  <- sprintf("lineage_lvl2 == 'Epithelium' & %s", cont_expr)
+    obj <- subset(TF_fetal_pediatric,
+                   subset = eval(str2expression(filt_expr)))
+    cat("Post-merge epithelial cells:", ncol(obj), "\n")
+    run_integration(obj)
+  }
+)
+cat("Post-merge epi:", ncol(TF_fetal_pediatric_epi_post), "cells\n")
+```
+
+```{r annotate-epi-post}
+TF_fetal_pediatric_epi_post$cluster   <- Idents(TF_fetal_pediatric_epi_post)
+TF_fetal_pediatric_epi_post$cell_type2 <-
+  ANNOT_EPI_POST_CELLTYPE[as.character(TF_fetal_pediatric_epi_post$cluster)]
+```
+
+```{r plot-epi-post, fig.width=FIG_W, fig.height=FIG_H}
+quick_dimplots(TF_fetal_pediatric_epi_post,
+               c("seurat_clusters","cell_type2","batch","group","TF_annotation_lvl3"),
+               prefix = "Epi Post – ")
+```
+
+## 5c · Epithelial markers and crosswalk
+
+```{r epi-markers}
+# Top markers per cluster to guide cell type assignment
+res_epi       <- wilcoxauc(TF_fetal_pediatric_epi_post, seurat_assay = "RNA")
+top_markers_epi <- top_markers(res_epi, n = 10)
+print(top_markers_epi)
+```
+
+```{r epi-crosswalk}
+TF_fetal_pediatric_epi_post@meta.data %>%
+  filter(!is.na(TF_annotation_lvl3)) %>%
+  group_by(cluster, TF_annotation_lvl3) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  slice_max(pct, n = 1, with_ties = FALSE) %>%
+  arrange(as.numeric(as.character(cluster)))
+```
+
+```{r epi-featureplot, fig.width=FIG_W, fig.height=8}
+DefaultAssay(TF_fetal_pediatric_epi_post) <- "SCT"
+FeaturePlot(TF_fetal_pediatric_epi_post,
+            features = c("SOX9","TESC","NPC2","SFTPC","AGER","SCGB3A2"),
+            ncol = 3, pt.size = 0.2, raster = RASTER) &
+  MY_COLORS & theme_void()
+```
+
+---
+
+# 6 · Alveolar Subsetting {.tabset}
+
+## 6a · Pre-alveolar
+
+```{r alve-pre}
+TF_fetal_pediatric_epi_pre_alve <- load_or_compute(
+  ckpt       = CKPT_alve_pre,
+  save_path  = SAVE_alve_pre,
+  label      = "pre-alveolar",
+  compute_fn = function() {
+    # Annotate pre-epi first
+    TF_fetal_pediatric_epi_pre$cluster    <- Idents(TF_fetal_pediatric_epi_pre)
+    TF_fetal_pediatric_epi_pre$cell_type2 <-
+      ANNOT_PRE_ALVE_CELLTYPE2[as.character(TF_fetal_pediatric_epi_pre$seurat_clusters)]
+
+    obj <- subset(TF_fetal_pediatric_epi_pre,
+                   subset = cell_type2 %in% ALVEOLAR_LABELS)
+    cat("Pre-alveolar cells:", ncol(obj), "\n")
+    run_integration(obj)
+  }
+)
+
+TF_fetal_pediatric_epi_pre_alve$cell_type2 <-
+  ANNOT_PRE_ALVE_CELLTYPE2[as.character(TF_fetal_pediatric_epi_pre_alve$seurat_clusters)]
+
+cat("Pre-alveolar:", ncol(TF_fetal_pediatric_epi_pre_alve), "cells\n")
+```
+
+```{r plot-alve-pre, fig.width=FIG_W, fig.height=FIG_H}
+quick_dimplots(TF_fetal_pediatric_epi_pre_alve,
+               c("cell_type2","group","batch"), prefix = "Pre-Alve – ")
+```
+
+## 6b · Post-alveolar
+
+```{r alve-post}
+TF_fetal_pediatric_epi_post_alve <- load_or_compute(
+  ckpt       = CKPT_alve_post,
+  save_path  = SAVE_alve_post,
+  label      = "post-alveolar",
+  compute_fn = function() {
+    obj <- subset(TF_fetal_pediatric_epi_post,
+                   subset = cell_type2 %in% ALVEOLAR_LABELS)
+    cat("Post-alveolar cells:", ncol(obj), "\n")
+    run_integration(obj)
+  }
+)
+
+TF_fetal_pediatric_epi_post_alve$cell_type2 <-
+  ANNOT_POST_ALVE_CELLTYPE2[as.character(TF_fetal_pediatric_epi_post_alve$seurat_clusters)]
+TF_fetal_pediatric_epi_post_alve$cell_type3 <-
+  ANNOT_POST_ALVE_CELLTYPE3[as.character(TF_fetal_pediatric_epi_post_alve$seurat_clusters)]
+
+cat("Post-alveolar:", ncol(TF_fetal_pediatric_epi_post_alve), "cells\n")
+```
+
+```{r plot-alve-post, fig.width=FIG_W, fig.height=FIG_H}
+quick_dimplots(TF_fetal_pediatric_epi_post_alve,
+               c("cell_type2","cell_type3","group","batch"), prefix = "Post-Alve – ")
+```
+
+---
+
+# 7 · Alveolar Visualization {.tabset}
+
+## 7a · Feature plots
+
+```{r featureplot-alve, fig.width=FIG_W, fig.height=10}
+DefaultAssay(TF_fetal_pediatric_epi_post_alve) <- "SCT"
+for (nm in names(MARKER_SETS)) {
+  genes <- MARKER_SETS[[nm]]
+  genes <- genes[genes %in% rownames(TF_fetal_pediatric_epi_post_alve)]
+  if (length(genes) == 0) next
+  p <- FeaturePlot(TF_fetal_pediatric_epi_post_alve,
+                   features = genes, pt.size = 0.2,
+                   raster = RASTER, combine = FALSE)
+  p <- lapply(seq_along(p), function(i)
+    p[[i]] + MY_COLORS + theme_void() + ggtitle(genes[i]) +
+      theme(plot.title = element_text(hjust = 0.5, size = 12)))
+  print(wrap_plots(p, ncol = 2) +
+          plot_annotation(title = paste(nm, "Markers"),
+                          theme = theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))))
+}
+```
+
+## 7b · Age gradient UMAP
+
+```{r age-gradient, fig.width=10, fig.height=5}
+meta    <- TF_fetal_pediatric_epi_post_alve@meta.data %>% rownames_to_column("cell")
+umap_df <- Embeddings(TF_fetal_pediatric_epi_post_alve, "umap") %>%
+  as.data.frame() %>% rownames_to_column("cell")
+plot_df <- left_join(umap_df, meta, by = "cell") %>%
+  filter(group %in% c("fetal","pediatric"), !is.na(age_days))
+
+ggplot() +
+  geom_point(data = filter(plot_df, group == "fetal"),
+             aes(umap_1, umap_2, color = age_days), size = PT_SIZE) +
+  scale_color_gradientn(colors = brewer.pal(9,"Purples"),
+                        name = "Fetal Age (days)",
+                        limits = range(filter(plot_df, group=="fetal")$age_days, na.rm=TRUE),
+                        na.value = "transparent") +
+  new_scale_color() +
+  geom_point(data = filter(plot_df, group == "pediatric"),
+             aes(umap_1, umap_2, color = age_days), size = PT_SIZE) +
+  scale_color_gradientn(colors = brewer.pal(9,"Oranges"),
+                        name = "Pediatric Age (days)",
+                        limits = range(filter(plot_df, group=="pediatric")$age_days, na.rm=TRUE),
+                        na.value = "transparent") +
+  theme_void() +
+  theme(legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14, face = "bold"))
+```
+
+## 7c · Dot plot
+
+```{r dotplot, fig.width=14, fig.height=6}
+# Change cell_type2 below to cell_type3 if using the collapsed annotation
+genes_use <- DOTPLOT_GENES[DOTPLOT_GENES %in% rownames(TF_fetal_pediatric_epi_pre_alve)]
+
+dd <- FetchData(TF_fetal_pediatric_epi_pre_alve,
+                vars = c("cell_type2", genes_use)) %>%
+  pivot_longer(all_of(genes_use), names_to = "gene", values_to = "expr") %>%
+  group_by(cell_type2, gene) %>%
+  summarise(avg_expr = mean(expr, na.rm = TRUE),
+            pct      = mean(expr > 0) * 100, .groups = "drop") %>%
+  mutate(gene = factor(gene, levels = genes_use))
+
+ggplot(dd, aes(x = gene, y = cell_type2, size = pct, color = avg_expr)) +
+  geom_point() +
+  scale_color_gradientn(colors = c("lightgrey","#EDF8B1","#C7E9B4","#7FCDBB",
+                                    "#41B6C4","#1D91C0","#225EA8","#253494","#081D58")) +
+  scale_size_area(max_size = 9) +
+  labs(x = "Gene", y = "Cell type",
+       size = "% expressing", color = "Avg expression") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        panel.grid  = element_blank())
+```
+
+## 7d · DEG heatmap
+
+```{r deg-heatmap, fig.width=10, fig.height=20}
+Idents(TF_fetal_pediatric_epi_post_alve) <- "cell_type3"
+
+deg_list <- lapply(levels(Idents(TF_fetal_pediatric_epi_post_alve)), function(ct) {
+  tryCatch(
+    FindMarkers(TF_fetal_pediatric_epi_post_alve, ident.1 = ct,
+                only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25),
+    error = function(e) NULL
+  )
+})
+names(deg_list) <- levels(Idents(TF_fetal_pediatric_epi_post_alve))
+
+top_genes <- unique(unlist(lapply(deg_list, function(d) {
+  if (is.null(d) || nrow(d) == 0) return(NULL)
+  head(rownames(d[order(-d$avg_log2FC), ]), 10)
+})))
+
+if (length(top_genes) > 0) {
+  expr_df <- FetchData(TF_fetal_pediatric_epi_post_alve,
+                        vars = c(top_genes, "cell_type3")) %>%
+    pivot_longer(-cell_type3, names_to = "gene", values_to = "expr") %>%
+    group_by(cell_type3, gene) %>%
+    summarise(avg = mean(expr, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = cell_type3, values_from = avg) %>%
+    column_to_rownames("gene")
+
+  scaled <- t(scale(t(as.matrix(expr_df))))
+  Heatmap(scaled, name = "Z-score",
+          cluster_rows = TRUE, cluster_columns = TRUE,
+          col = viridis(100), show_row_names = TRUE,
+          row_names_gp = gpar(fontsize = 6),
+          column_names_gp = gpar(fontsize = 11, rot = 45))
+}
+```
+
+---
+
+# 8 · Slingshot Trajectory {.tabset}
+
+## 8a · Pre-merge trajectory
+
+```{r slingshot-pre}
+# Re-cluster at res 0.6 for trajectory (finer clusters)
+DefaultAssay(TF_fetal_pediatric_epi_pre_alve) <- "SCT"
+red_pre <- if ("integrated.dr" %in% names(TF_fetal_pediatric_epi_pre_alve@reductions))
+  "integrated.dr" else "pca"
+TF_fetal_pediatric_epi_pre_alve <- FindNeighbors(
+  TF_fetal_pediatric_epi_pre_alve, dims = seq_len(DIMS), reduction = red_pre, verbose = FALSE)
+TF_fetal_pediatric_epi_pre_alve <- FindClusters(
+  TF_fetal_pediatric_epi_pre_alve, resolution = 0.6)
+TF_fetal_pediatric_epi_pre_alve <- RunUMAP(
+  TF_fetal_pediatric_epi_pre_alve, dims = seq_len(DIMS), reduction = red_pre)
+TF_fetal_pediatric_epi_pre_alve$cell_type2 <-
+  ANNOT_PRE_ALVE_CELLTYPE2[as.character(TF_fetal_pediatric_epi_pre_alve$seurat_clusters)]
+
+dimred_pre  <- TF_fetal_pediatric_epi_pre_alve@reductions$umap@cell.embeddings
+clustering_pre <- TF_fetal_pediatric_epi_pre_alve$cell_type2
+counts_pre  <- GetAssayData(TF_fetal_pediatric_epi_pre_alve, assay = "RNA", layer = "counts")
+
+sds_pre <- load_or_compute(
+  ckpt       = CKPT_sds_pre,
+  save_path  = SAVE_sds_pre,
+  label      = "slingshot pre",
+  compute_fn = function() {
+    lin <- getLineages(data = dimred_pre, clusterLabels = clustering_pre,
+                       start.clus = TRAJ_START, dist.method = TRAJ_DIST)
+    sds <- getCurves(lin, approx_points = TRAJ_APPROX_PTS, thresh = TRAJ_THRESH,
+                     stretch = TRAJ_STRETCH, allow.breaks = FALSE, shrink = TRAJ_SHRINK)
+    SlingshotDataSet(sds)
+  }
+)
+cat("Pre lineages:", length(sds_pre@lineages), "\n")
+```
+
+```{r plot-slingshot-pre, fig.width=FIG_W, fig.height=FIG_H}
+# Extract Seurat cluster colors
+Idents(TF_fetal_pediatric_epi_pre_alve) <- "cell_type2"
+p_col <- DimPlot(TF_fetal_pediatric_epi_pre_alve, group.by = "cell_type2")
+pb    <- ggplot_build(p_col)
+col_levels  <- levels(Idents(TF_fetal_pediatric_epi_pre_alve))
+umap_colors <- setNames(unique(pb$data[[1]]$colour), col_levels)
+
+plot(dimred_pre[,1:2], col = umap_colors[as.character(clustering_pre)],
+     cex = 0.5, pch = 16, xlab = "", ylab = "", axes = FALSE)
+lines(sds_pre, lwd = 4, col = adjustcolor("steelblue", 0.8))
+for (cl in unique(as.character(clustering_pre))) {
+  idx <- which(as.character(clustering_pre) == cl)
+  if (length(idx) > 0)
+    text(mean(dimred_pre[idx,1]), mean(dimred_pre[idx,2]), cl, font = 2, cex = 0.9)
+}
+```
+
+```{r pseudotime-pre, fig.width=FIG_W, fig.height=FIG_H}
+pt_all_pre  <- slingPseudotime(sds_pre)
+pt_comb_pre <- combined_pt_from_sds(sds_pre, rownames(dimred_pre))
+pt_comb_pre[is.na(pt_comb_pre)] <- 0
+
+pal_pre  <- MY_COLORS_FN(200)
+idx_pre  <- pmax(1, pmin(200, 1 + floor(scale01(pt_comb_pre) * 199)))
+pt_cols  <- pal_pre[idx_pre]
+
+plot(dimred_pre[,1:2], col = pt_cols, pch = 16, cex = 0.5, axes = FALSE,
+     xlab = "", ylab = "", main = "Pre-alve: weighted pseudotime")
+for (cl in unique(as.character(clustering_pre))) {
+  idx <- which(as.character(clustering_pre) == cl)
+  if (length(idx) > 0)
+    text(mean(dimred_pre[idx,1]), mean(dimred_pre[idx,2]), cl, font = 2, cex = 0.9, col = "darkred")
+}
+```
+
+```{r ridge-pre, fig.width=8, fig.height=12}
+pt_long_pre <- as.data.frame(pt_all_pre) %>%
+  mutate(cell_type = clustering_pre) %>%
+  pivot_longer(colnames(pt_all_pre), names_to = "lineage", values_to = "pt") %>%
+  filter(!is.na(pt)) %>%
+  filter(mapply(function(ln, ct) isTRUE(ct %in% RIDGE_KEEP[[ln]]), lineage, cell_type))
+
+meds_pre <- pt_long_pre %>%
+  group_by(lineage, cell_type) %>% summarize(med = median(pt), .groups = "drop")
+
+pt_long_pre %>%
+  left_join(meds_pre, by = c("lineage","cell_type")) %>%
+  mutate(cell_ord = reorder_within(cell_type, med, within = lineage)) %>%
+  ggplot(aes(x = pt, y = cell_ord, fill = after_stat(x))) +
+  geom_density_ridges_gradient(scale = 2.2, rel_min_height = 0.01,
+                                size = 0.2, color = "white") +
+  scale_fill_gradientn(colors = MY_COLORS_FN(200), name = "Pseudotime") +
+  scale_y_reordered() +
+  facet_wrap(~lineage, ncol = 1, scales = "free_y") +
+  labs(x = "Pseudotime", y = NULL, title = "Pre — pseudotime by cell type") +
+  theme_ridges() + theme(panel.grid = element_blank())
+```
+
+## 8b · Post-merge trajectory
+
+```{r slingshot-post}
+dimred_post     <- TF_fetal_pediatric_epi_post_alve@reductions$umap@cell.embeddings
+clustering_post <- TF_fetal_pediatric_epi_post_alve$cell_type2
+counts_post_raw <- GetAssayData(TF_fetal_pediatric_epi_post_alve, assay = "RNA", layer = "counts")
+
+sds_post <- load_or_compute(
+  ckpt       = CKPT_sds_post,
+  save_path  = SAVE_sds_post,
+  label      = "slingshot post",
+  compute_fn = function() {
+    lin <- getLineages(data = dimred_post, clusterLabels = clustering_post,
+                       start.clus = TRAJ_START, dist.method = TRAJ_DIST)
+    sds <- getCurves(lin, approx_points = TRAJ_APPROX_PTS, thresh = TRAJ_THRESH,
+                     stretch = TRAJ_STRETCH, allow.breaks = FALSE, shrink = TRAJ_SHRINK)
+    SlingshotDataSet(sds)
+  }
+)
+cat("Post lineages:", length(sds_post@lineages), "\n")
+```
+
+```{r plot-slingshot-post, fig.width=FIG_W, fig.height=FIG_H}
+Idents(TF_fetal_pediatric_epi_post_alve) <- "cell_type2"
+p_col2 <- DimPlot(TF_fetal_pediatric_epi_post_alve, group.by = "cell_type2")
+pb2    <- ggplot_build(p_col2)
+col_lv2    <- levels(Idents(TF_fetal_pediatric_epi_post_alve))
+umap_col2  <- setNames(unique(pb2$data[[1]]$colour), col_lv2)
+
+plot(dimred_post[,1:2], col = umap_col2[as.character(clustering_post)],
+     cex = 0.5, pch = 16, xlab = "", ylab = "", axes = FALSE)
+lines(sds_post, lwd = 4, col = adjustcolor("steelblue", 0.8))
+for (cl in unique(as.character(clustering_post))) {
+  idx <- which(as.character(clustering_post) == cl)
+  if (length(idx) > 0)
+    text(mean(dimred_post[idx,1]), mean(dimred_post[idx,2]), cl, font = 2, cex = 0.9)
+}
+```
+
+```{r pseudotime-post, fig.width=FIG_W, fig.height=FIG_H}
+pt_comb_post <- combined_pt_from_sds(sds_post, rownames(dimred_post))
+pt_comb_post[is.na(pt_comb_post)] <- 0
+idx_post  <- pmax(1, pmin(200, 1 + floor(scale01(pt_comb_post) * 199)))
+pt_cols2  <- pal_pre[idx_post]
+
+plot(dimred_post[,1:2], col = pt_cols2, pch = 16, cex = 0.5, axes = FALSE,
+     xlab = "", ylab = "", main = "Post-alve: weighted pseudotime")
+for (cl in unique(as.character(clustering_post))) {
+  idx <- which(as.character(clustering_post) == cl)
+  if (length(idx) > 0)
+    text(mean(dimred_post[idx,1]), mean(dimred_post[idx,2]), cl, font = 2, cex = 0.9, col = "darkred")
+}
+```
+
+---
+
+# 9 · tradeSeq {.tabset}
+
+## 9a · Fit GAMs (pre-merge)
+
+```{r tradeseq-pre}
+# Use variable features unless TRADESEQ_GENES is set
+genes_pre <- if (!is.null(TRADESEQ_GENES)) TRADESEQ_GENES else
+  VariableFeatures(TF_fetal_pediatric_epi_pre_alve)
+filt_counts_pre <- counts_pre[genes_pre[genes_pre %in% rownames(counts_pre)], ]
+
+sce_pre <- load_or_compute(
+  ckpt       = CKPT_sce_pre,
+  save_path  = SAVE_sce_pre,
+  label      = "tradeSeq pre",
+  compute_fn = function() {
+    bp <- MulticoreParam(workers = TRADESEQ_CORES)
+    register(bp)
+    # sds_pre is the explicit SDS object — fixes the 'curves' variable bug
+    sce <- fitGAM(counts = as.matrix(filt_counts_pre), sds = sds_pre,
+                  nknots = TRADESEQ_NKNOTS, BPPARAM = bp)
+    # Store pseudotime in colData
+    pt_gam <- slingPseudotime(sds_pre)
+    common  <- intersect(colnames(sce), rownames(pt_gam))
+    for (j in seq_len(ncol(pt_gam)))
+      colData(sce)[common, paste0("pt_lineage", j)] <- pt_gam[common, j]
+    sce
+  }
+)
+plotGeneCount(sds_pre, filt_counts_pre, clusters = clustering_pre, models = sce_pre)
+```
+
+```{r tradeseq-tests-pre}
+assoRes_pre  <- associationTest(sce_pre)
+# Fix: sce_pre passed explicitly (original had 'sce2' undefined)
+startRes_pre <- startVsEndTest(sce_pre, lineages = TRUE) %>%
+  rownames_to_column("gene") %>% filter(!grepl("^MT-", gene))
+patternRes_pre <- patternTest(sce_pre, pairwise = TRUE) %>%
+  rownames_to_column("gene") %>% filter(!grepl("^MT-", gene))
+earlyDE_pre  <- earlyDETest(sce_pre, knots = c(1, 2))
+endRes_pre   <- diffEndTest(sce_pre)
+
+cat("Top startVsEnd genes (pre):\n")
+n_lin_pre <- sum(grepl("^waldStat_lineage", colnames(startRes_pre)))
+for (k in seq_len(n_lin_pre)) {
+  colk <- paste0("waldStat_lineage", k)
+  if (colk %in% colnames(startRes_pre)) {
+    top5 <- startRes_pre %>% arrange(desc(.data[[colk]])) %>% slice_head(n = 5) %>%
+      pull(gene)
+    cat("  Lineage", k, ":", paste(top5, collapse = ", "), "\n")
+  }
+}
+```
+
+```{r tradeseq-smoothers-pre, fig.width=10, fig.height=5}
+for (g in SMOOTHER_GENES) {
+  if (g %in% rownames(sce_pre)) {
+    print(plotSmoothers(sce_pre, filt_counts_pre, gene = g) + ggtitle(paste("Pre –", g)))
+  }
+}
+```
+
+## 9b · Fit GAMs (post-merge)
+
+```{r tradeseq-post}
+genes_post <- if (!is.null(TRADESEQ_GENES)) TRADESEQ_GENES else
+  VariableFeatures(TF_fetal_pediatric_epi_post_alve)
+filt_counts_post <- counts_post_raw[genes_post[genes_post %in% rownames(counts_post_raw)], ]
+
+sce_post <- load_or_compute(
+  ckpt       = CKPT_sce_post,
+  save_path  = SAVE_sce_post,
+  label      = "tradeSeq post",
+  compute_fn = function() {
+    bp <- MulticoreParam(workers = TRADESEQ_CORES)
+    register(bp)
+    # sds_post passed explicitly
+    sce <- fitGAM(counts = as.matrix(filt_counts_post), sds = sds_post,
+                  nknots = TRADESEQ_NKNOTS, BPPARAM = bp)
+    pt_gam <- slingPseudotime(sds_post)
+    common  <- intersect(colnames(sce), rownames(pt_gam))
+    for (j in seq_len(ncol(pt_gam)))
+      colData(sce)[common, paste0("pt_lineage", j)] <- pt_gam[common, j]
+    sce
+  }
+)
+plotGeneCount(sds_post, filt_counts_post, clusters = clustering_post, models = sce_post)
+```
+
+```{r tradeseq-tests-post}
+assoRes_post   <- associationTest(sce_post)
+startRes_post  <- startVsEndTest(sce_post, lineages = TRUE) %>%
+  rownames_to_column("gene") %>% filter(!grepl("^MT-", gene))
+patternRes_post <- patternTest(sce_post, pairwise = TRUE) %>%
+  rownames_to_column("gene") %>% filter(!grepl("^MT-", gene))
+earlyDE_post   <- earlyDETest(sce_post, knots = c(1, 2))
+endRes_post    <- diffEndTest(sce_post)
+
+cat("Top startVsEnd genes (post):\n")
+n_lin_post <- sum(grepl("^waldStat_lineage", colnames(startRes_post)))
+for (k in seq_len(n_lin_post)) {
+  colk <- paste0("waldStat_lineage", k)
+  if (colk %in% colnames(startRes_post)) {
+    top5 <- startRes_post %>% arrange(desc(.data[[colk]])) %>% slice_head(n = 5) %>%
+      pull(gene)
+    cat("  Lineage", k, ":", paste(top5, collapse = ", "), "\n")
+  }
+}
+```
+
+```{r tradeseq-smoothers-post, fig.width=10, fig.height=5}
+for (g in SMOOTHER_GENES) {
+  if (g %in% rownames(sce_post)) {
+    print(plotSmoothers(sce_post, filt_counts_post, gene = g) + ggtitle(paste("Post –", g)))
+  }
+}
+```
+
+## 9c · Heatmaps
+
+```{r tradeseq-heatmaps, fig.width=20, fig.height=8}
+for (branch in c("pre","post")) {
+  sr   <- if (branch == "pre") startRes_pre else startRes_post
+  obj  <- if (branch == "pre") TF_fetal_pediatric_epi_pre_alve else TF_fetal_pediatric_epi_post_alve
+  ctcol <- "cell_type3"
+  if (!ctcol %in% colnames(obj@meta.data)) ctcol <- "cell_type2"
+
+  topN <- 20
+  n_lin <- sum(grepl("^waldStat_lineage", colnames(sr)))
+  top_by_lin <- lapply(seq_len(n_lin), function(k) {
+    colk <- paste0("waldStat_lineage", k)
+    if (!colk %in% colnames(sr)) return(character(0))
+    sr %>% arrange(desc(.data[[colk]])) %>% slice_head(n = topN) %>% pull(gene)
+  })
+  names(top_by_lin) <- paste0("Lineage", seq_len(n_lin))
+
+  avg_exp  <- AverageExpression(obj, group.by = ctcol, assays = "RNA", slot = "data")$RNA
+  avg_norm <- setNames(colnames(avg_exp), normalize_labels(colnames(avg_exp)))
+  col_fun  <- colorRamp2(c(-2, 0, 2), c("darkgreen","white","red"))
+
+  ht_list <- lapply(seq_len(n_lin), function(k) {
+    lin_name    <- paste0("Lineage", k)
+    genes_k     <- intersect(top_by_lin[[lin_name]], rownames(avg_exp))
+    wanted_disp <- HT_LINEAGE_ORDER[[lin_name]]
+    if (is.null(wanted_disp) || length(genes_k) == 0) return(NULL)
+    wanted_norm  <- normalize_labels(wanted_disp)
+    mapped       <- unname(avg_norm[wanted_norm])
+    miss         <- is.na(mapped)
+    avg_ext      <- avg_exp
+    if (any(miss)) {
+      filler <- matrix(NA_real_, nrow(avg_exp), sum(miss),
+                       dimnames = list(rownames(avg_exp), wanted_disp[miss]))
+      avg_ext <- cbind(avg_exp, filler)
+      mapped[miss] <- wanted_disp[miss]
+    }
+    mat  <- as.matrix(avg_ext[genes_k, mapped, drop = FALSE])
+    colnames(mat) <- wanted_disp
+    Heatmap(scale_rows(mat), name = paste0("Z(L",k,")"), col = col_fun,
+            na_col = "grey95", cluster_rows = FALSE, cluster_columns = FALSE,
+            column_title = paste0(branch, " L", k),
+            row_title_gp = gpar(fontface = "bold"),
+            heatmap_legend_param = list(at = c(-2,0,2), labels = c("Low","Mid","High")))
+  })
+  ht_list <- Filter(Negate(is.null), ht_list)
+  if (length(ht_list) > 0) {
+    grid.newpage()
+    ht_combined <- Reduce(`+`, ht_list)
+    draw(ht_combined, column_title = paste(branch, "branch — top", topN, "genes per lineage"))
+  }
+}
+```
+
+---
+
+# 10 · CellChat {.tabset}
+
+## 10a · Build / load CellChat objects
+
+```{r cellchat-pre}
+cellchat_pre <- load_or_compute(
+  ckpt       = CKPT_cellchat_pre,
+  save_path  = SAVE_cellchat_pre,
+  label      = "CellChat pre",
+  compute_fn = function() {
+    obj  <- TF_fetal_pediatric_epi_pre_alve
+    data.input <- GetAssayData(obj, assay = "SCT", layer = "data")
+    meta <- data.frame(labels = obj@meta.data[[CC_LABEL_COL]],
+                       samples = as.factor(obj@meta.data[[CC_SAMPLE_COL]]),
+                       row.names = colnames(obj))
+    cc <- createCellChat(object = data.input, meta = meta)
+    cc@DB <- CellChatDB.human
+    cc <- subsetData(cc)
+    future::plan("multisession", workers = 4)
+    cc <- identifyOverExpressedGenes(cc)
+    cc <- identifyOverExpressedInteractions(cc)
+    cc <- smoothData(cc, adj = PPI.human)
+    future::plan("sequential")
+    options(future.globals.maxSize = 8 * 1024^3)
+    cc <- computeCommunProb(cc, type = "triMean", trim = NULL, raw.use = FALSE)
+    cc <- filterCommunication(cc, min.cells = CC_MIN_CELLS)
+    cc <- computeCommunProbPathway(cc)
+    cc <- aggregateNet(cc)
+    cc <- netAnalysis_computeCentrality(cc, slot.name = "netP")
+    cc
+  }
+)
+cat("Pre CellChat pathways:", length(cellchat_pre@netP$pathways), "\n")
+```
+
+```{r cellchat-post}
+cellchat_post <- load_or_compute(
+  ckpt       = CKPT_cellchat_post,
+  save_path  = SAVE_cellchat_post,
+  label      = "CellChat post",
+  compute_fn = function() {
+    obj  <- TF_fetal_pediatric_epi_post_alve
+    data.input <- GetAssayData(obj, assay = "SCT", layer = "data")
+    meta <- data.frame(labels = obj@meta.data[[CC_LABEL_COL]],
+                       samples = as.factor(obj@meta.data[[CC_SAMPLE_COL]]),
+                       row.names = colnames(obj))
+    cc <- createCellChat(object = data.input, meta = meta)
+    cc@DB <- CellChatDB.human
+    cc <- subsetData(cc)
+    future::plan("multisession", workers = 4)
+    cc <- identifyOverExpressedGenes(cc)
+    cc <- identifyOverExpressedInteractions(cc)
+    cc <- smoothData(cc, adj = PPI.human)
+    future::plan("sequential")
+    options(future.globals.maxSize = 8 * 1024^3)
+    cc <- computeCommunProb(cc, type = "triMean", trim = NULL, raw.use = FALSE)
+    cc <- filterCommunication(cc, min.cells = CC_MIN_CELLS)
+    cc <- computeCommunProbPathway(cc)
+    cc <- aggregateNet(cc)
+    cc <- netAnalysis_computeCentrality(cc, slot.name = "netP")
+    cc
+  }
+)
+cat("Post CellChat pathways:", length(cellchat_post@netP$pathways), "\n")
+```
+
+## 10b · Pathway plots
+
+```{r cellchat-plots, fig.width=8, fig.height=8}
+for (pw in CC_PATHWAYS) {
+  for (branch in c("pre","post")) {
+    cc <- if (branch == "pre") cellchat_pre else cellchat_post
+    if (!pw %in% cc@netP$pathways) {
+      cat("Pathway", pw, "not found in", branch, "— skipping\n")
+      next
+    }
+    cat("===", pw, "(", branch, ") ===\n")
+    netVisual_aggregate(cc, signaling = pw, layout = "circle")
+    title(paste(pw, "—", branch, "— circle"), line = 1, cex.main = 1.2)
+  }
+}
+```
+
+```{r cellchat-bubble, fig.width=10, fig.height=6}
+for (pw in CC_PATHWAYS) {
+  for (branch in c("pre","post")) {
+    cc <- if (branch == "pre") cellchat_pre else cellchat_post
+    if (!pw %in% cc@netP$pathways) next
+    p <- netVisual_bubble(cc,
+                           sources.use    = CC_SOURCES,
+                           targets.use    = CC_TARGETS,
+                           signaling      = pw,
+                           remove.isolate = FALSE) +
+      ggtitle(paste(pw, "—", branch))
+    print(p)
+  }
+}
+```
+
+```{r cellchat-heatmap, fig.width=8, fig.height=6}
+for (branch in c("pre","post")) {
+  cc <- if (branch == "pre") cellchat_pre else cellchat_post
+  for (pw in CC_PATHWAYS) {
+    if (pw %in% cc@netP$pathways)
+      print(netVisual_heatmap(cc, signaling = pw, color.heatmap = "Reds") +
+              ggtitle(paste(pw, "—", branch, "— heatmap")))
+  }
+}
+```
+
+```{r cellchat-signaling-roles, fig.width=10, fig.height=5}
+for (branch in c("pre","post")) {
+  cc <- if (branch == "pre") cellchat_pre else cellchat_post
+  ht1 <- netAnalysis_signalingRole_heatmap(cc, pattern = "outgoing")
+  ht2 <- netAnalysis_signalingRole_heatmap(cc, pattern = "incoming")
+  draw(ht1 + ht2)
+}
+```
+
+---
+
+# 11 · Cell Composition {.tabset}
+
+## 11a · Age distributions
+
+```{r composition-age, fig.width=10, fig.height=10}
+for (branch in c("pre","post")) {
+  obj   <- if (branch == "pre") TF_fetal_pediatric_epi_pre_alve else TF_fetal_pediatric_epi_post_alve
+  ctcol <- if ("cell_type3" %in% colnames(obj@meta.data)) "cell_type3" else "cell_type2"
+  meta  <- obj@meta.data
+
+  for (cts in list(c("Bud Tip","AT2_2","AT2_1","AT2_3"),
+                    c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_3"))) {
+    cts <- cts[cts %in% meta[[ctcol]]]
+    if (length(cts) == 0) next
+
+    plot_df <- meta[meta[[ctcol]] %in% cts & meta$group %in% c("fetal","pediatric"), ]
+    plot_df[[ctcol]] <- factor(plot_df[[ctcol]], levels = cts)
+    plot_df$group    <- factor(plot_df$group, levels = c("fetal","pediatric"))
+
+    p <- ggplot(plot_df, aes(x = age_days, fill = group)) +
+      geom_histogram(bins = 25, color = "black") +
+      facet_grid(reformulate("group", ctcol), scales = "free_x") +
+      scale_fill_manual(values = c(fetal = COL_FETAL, pediatric = COL_PED)) +
+      theme_classic(base_size = 13) +
+      labs(title = paste0(branch, " — age distribution"),
+           x = "Age (days)", y = "Cells") +
+      guides(fill = "none")
+    print(p)
+  }
+}
+```
+
+## 11b · % total per sample
+
+```{r composition-pct, fig.width=10, fig.height=6}
+for (branch in c("pre","post")) {
+  obj   <- if (branch == "pre") TF_fetal_pediatric_epi_pre_alve else TF_fetal_pediatric_epi_post_alve
+  ctcol <- if ("cell_type3" %in% colnames(obj@meta.data)) "cell_type3" else "cell_type2"
+  meta  <- obj@meta.data
+
+  total_df <- meta %>% group_by(batch) %>% summarise(total = n(), .groups = "drop")
+
+  pct_all <- meta %>%
+    filter(group %in% c("fetal","pediatric")) %>%
+    group_by(batch, group, age_days, .data[[ctcol]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    left_join(total_df, by = "batch") %>%
+    mutate(pct = 100 * n / total) %>%
+    filter(!is.na(age_days), !is.na(pct)) %>%
+    arrange(.data[[ctcol]], group, age_days) %>%
+    mutate(sample_age = paste0(batch, " (", age_days, ")")) %>%
+    group_by(.data[[ctcol]], group) %>%
+    mutate(sample_age = factor(sample_age, levels = unique(sample_age))) %>%
+    ungroup()
+
+  p <- ggplot(pct_all, aes(x = sample_age, y = pct, fill = group)) +
+    geom_col(color = "black", width = 0.85) +
+    facet_wrap(reformulate(ctcol), ncol = 2, scales = "free_x") +
+    scale_fill_manual(values = c(fetal = COL_FETAL, pediatric = COL_PED)) +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8)) +
+    labs(title = paste0(branch, " — cell type % of total"),
+         x = NULL, y = "% of total cells") +
+    guides(fill = "none")
+  print(p)
+}
+```
+
+## 11c · Lineage-filtered composition (Slingshot weights)
+
+```{r composition-lineage, fig.width=10, fig.height=8}
+# Uses the pre-merge Slingshot weights
+if (exists("sds_pre") && !is.null(sds_pre)) {
+  w_sling <- tryCatch(SummarizedExperiment::assay(sds_pre, "weights"),
+                       error = function(e) slingCurveWeights(sds_pre))
+
+  lineage_celltypes <- list(
+    Lineage1 = c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_1","AT1_2"),
+    Lineage2 = c("Bud Tip","AT2_2","Transitional","AT1_5","AT1_4","AT1_3"),
+    Lineage3 = c("Bud Tip","AT2_2","AT2_1","AT2_3"),
+    Lineage4 = c("Bud Tip","AT2_2","AT2_1","AT2_4")
+  )
+
+  meta_pre <- TF_fetal_pediatric_epi_pre_alve@meta.data %>% rownames_to_column("cell")
+  ctcol    <- if ("cell_type3" %in% colnames(meta_pre)) "cell_type3" else "cell_type2"
+
+  for (ln in colnames(w_sling)) {
+    cts <- lineage_celltypes[[ln]]
+    if (is.null(cts)) next
+    cells_lin <- rownames(w_sling)[w_sling[, ln] > 0]
+
+    plot_df <- meta_pre %>%
+      filter(cell %in% cells_lin, .data[[ctcol]] %in% cts,
+             group %in% c("fetal","pediatric")) %>%
+      group_by(.data[[ctcol]], group, batch, age_days) %>%
+      summarise(n_cells = n(), .groups = "drop") %>%
+      arrange(.data[[ctcol]], group, age_days) %>%
+      group_by(.data[[ctcol]], group) %>%
+      mutate(sample_age = factor(paste0(batch," (",age_days,")"),
+                                  levels = unique(paste0(batch," (",age_days,")")))) %>%
+      ungroup()
+    plot_df[[ctcol]] <- factor(plot_df[[ctcol]], levels = cts)
+    plot_df$group    <- factor(plot_df$group, levels = c("fetal","pediatric"))
+
+    p <- ggplot(plot_df, aes(x = sample_age, y = n_cells, fill = group)) +
+      geom_col(color = "black", width = 0.85) +
+      facet_grid(reformulate("group", ctcol), scales = "free_x", space = "free_x") +
+      scale_fill_manual(values = c(fetal = COL_FETAL, pediatric = COL_PED)) +
+      theme_classic(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+      labs(title = paste0("Cell counts — ", ln, " (by Slingshot weights)"),
+           x = NULL, y = "Cells") +
+      guides(fill = "none")
+    print(p)
+  }
+}
+```
+
+---
+
+# 12 · Session Info
+
+```{r session-info}
+sessionInfo()
+```
